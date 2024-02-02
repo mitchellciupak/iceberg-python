@@ -2469,7 +2469,7 @@ class TablePartition:
     arrow_table_partition: pa.Table
 
 
-def get_partition_sort_order(partition_columns: list[str], reverse: bool = False) -> dict[str, Any]:
+def _get_partition_sort_order(partition_columns: list[str], reverse: bool = False) -> dict[str, Any]:
     order = 'ascending' if not reverse else 'descending'
     null_placement = 'at_start' if reverse else 'at_end'
     return {'sort_keys': [(column_name, order) for column_name in partition_columns], 'null_placement': null_placement}
@@ -2487,12 +2487,12 @@ def group_by_partition_scheme(iceberg_table: Table, arrow_table: pa.Table, parti
         )
 
     # only works for identity
-    sort_options = get_partition_sort_order(partition_columns, reverse=False)
+    sort_options = _get_partition_sort_order(partition_columns, reverse=False)
     sorted_arrow_table = arrow_table.sort_by(sorting=sort_options['sort_keys'], null_placement=sort_options['null_placement'])
     return sorted_arrow_table
 
 
-def get_partition_columns(iceberg_table: Table, arrow_table: pa.Table) -> list[str]:
+def _get_partition_columns(iceberg_table: Table, arrow_table: pa.Table) -> list[str]:
     arrow_table_cols = set(arrow_table.column_names)
     partition_cols = []
     for transform_field in iceberg_table.spec().fields:
@@ -2505,13 +2505,13 @@ def get_partition_columns(iceberg_table: Table, arrow_table: pa.Table) -> list[s
     return partition_cols
 
 
-def get_partition_key(arrow_table: pa.Table, partition_columns: list[str], offset: int) -> Record:
+def _get_partition_key(arrow_table: pa.Table, partition_columns: list[str], offset: int) -> Record:
     # todo: Instead of fetching partition keys one at a time, try filtering by a mask made of offsets, and convert to py together,
     # possibly slightly more efficient.
     return Record(**{col: arrow_table.column(col)[offset].as_py() for col in partition_columns})
 
 
-def partition(iceberg_table: Table, arrow_table: pa.Table) -> Iterable[TablePartition]:
+def _partition(iceberg_table: Table, arrow_table: pa.Table) -> Iterable[TablePartition]:
     """Based on the iceberg table partition spec, slice the arrow table into partitions with their keys.
 
     Example:
@@ -2539,11 +2539,11 @@ def partition(iceberg_table: Table, arrow_table: pa.Table) -> Iterable[TablePart
     """
     import pyarrow as pa
 
-    partition_columns = get_partition_columns(iceberg_table, arrow_table)
+    partition_columns = _get_partition_columns(iceberg_table, arrow_table)
 
     arrow_table = group_by_partition_scheme(iceberg_table, arrow_table, partition_columns)
 
-    reversing_sort_order_options = get_partition_sort_order(partition_columns, reverse=True)
+    reversing_sort_order_options = _get_partition_sort_order(partition_columns, reverse=True)
     reversed_indices = pa.compute.sort_indices(arrow_table, **reversing_sort_order_options).to_pylist()
 
     slice_instructions = []
@@ -2559,7 +2559,7 @@ def partition(iceberg_table: Table, arrow_table: pa.Table) -> Iterable[TablePart
 
     table_partitions: list[TablePartition] = [
         TablePartition(
-            partition_key=get_partition_key(arrow_table, partition_columns, inst["offset"]),
+            partition_key=_get_partition_key(arrow_table, partition_columns, inst["offset"]),
             arrow_table_partition=arrow_table.slice(**inst),
         )
         for inst in slice_instructions
@@ -2574,7 +2574,7 @@ def _dataframe_to_data_files(table: Table, df: pa.Table) -> Iterable[DataFile]:
     counter = itertools.count(0)
 
     if len(table.spec().fields) > 0:
-        partitions = partition(table, df)
+        partitions = _partition(table, df)
         yield from write_file(
             table,
             iter([
