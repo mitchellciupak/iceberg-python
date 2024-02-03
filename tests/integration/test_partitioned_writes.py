@@ -64,7 +64,7 @@ def catalog() -> Catalog:
     return catalog
 
 
-TEST_DATA_without_null = {
+TEST_DATA_WITH_NULL = {
     'bool': [False, None, True],
     'string': ['a', None, 'z'],
     # Go over the 16 bytes to kick in truncation
@@ -168,7 +168,30 @@ def arrow_table_without_null() -> pa.Table:
     return pa.Table.from_pydict(TEST_DATA_WITHOUT_NULL, schema=pa_schema)
 
 
-# working on
+@pytest.fixture(scope="session")
+def arrow_table_with_null() -> pa.Table:
+    """PyArrow table with all kinds of columns"""
+    pa_schema = pa.schema([
+        ("bool", pa.bool_()),
+        ("string", pa.string()),
+        ("string_long", pa.string()),
+        ("int", pa.int32()),
+        ("long", pa.int64()),
+        ("float", pa.float32()),
+        ("double", pa.float64()),
+        ("timestamp", pa.timestamp(unit="us")),
+        ("timestamptz", pa.timestamp(unit="us", tz="UTC")),
+        ("date", pa.date32()),
+        # Not supported by Spark
+        # ("time", pa.time64("us")),
+        # Not natively supported by Arrow
+        # ("uuid", pa.fixed(16)),
+        ("binary", pa.binary()),
+        ("fixed", pa.binary(16)),
+    ])
+    return pa.Table.from_pydict(TEST_DATA_WITH_NULL, schema=pa_schema)
+
+#1
 @pytest.fixture(scope="session", autouse=True)
 def table_v1_without_null_partitioned(session_catalog: Catalog, arrow_table_without_null: pa.Table) -> None:
     identifier = "default.arrow_table_v1_without_null_partitioned"
@@ -188,7 +211,27 @@ def table_v1_without_null_partitioned(session_catalog: Catalog, arrow_table_with
 
     assert tbl.format_version == 1, f"Expected v1, got: v{tbl.format_version}"
 
+#1
+@pytest.fixture(scope="session", autouse=True)
+def table_v1_with_null_partitioned(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v1_with_null_partitioned"
 
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(
+        identifier=identifier,
+        schema=TABLE_SCHEMA,
+        partition_spec=PartitionSpec(PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="int")),
+        properties={'format-version': '1'},
+    )
+    tbl.append(arrow_table_with_null)
+
+    assert tbl.format_version == 1, f"Expected v1, got: v{tbl.format_version}"
+
+#2
 @pytest.fixture(scope="session", autouse=True)
 def table_v1_appended_without_null_partitioned(session_catalog: Catalog, arrow_table_without_null: pa.Table) -> None:
     identifier = "default.arrow_table_v1_appended_without_null_partitioned"
@@ -202,6 +245,23 @@ def table_v1_appended_without_null_partitioned(session_catalog: Catalog, arrow_t
 
     for _ in range(2):
         tbl.append(arrow_table_without_null)
+
+    assert tbl.format_version == 1, f"Expected v1, got: v{tbl.format_version}"
+
+#2
+@pytest.fixture(scope="session", autouse=True)
+def table_v1_appended_with_null_partitioned(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v1_appended_with_null_partitioned"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(identifier=identifier, schema=TABLE_SCHEMA, properties={'format-version': '1'})
+
+    for _ in range(2):
+        tbl.append(arrow_table_with_null)
 
     assert tbl.format_version == 1, f"Expected v1, got: v{tbl.format_version}"
 
@@ -225,6 +285,25 @@ def table_v2_without_null_partitioned(session_catalog: Catalog, arrow_table_with
 
     assert tbl.format_version == 2, f"Expected v2, got: v{tbl.format_version}"
 
+@pytest.fixture(scope="session", autouse=True)
+def table_v2_with_null_partitioned(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v2_with_null_partitioned"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(
+        identifier=identifier,
+        schema=TABLE_SCHEMA,
+        partition_spec=PartitionSpec(PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="int")),
+        properties={'format-version': '2'},
+    )
+    tbl.append(arrow_table_with_null)
+
+    assert tbl.format_version == 2, f"Expected v2, got: v{tbl.format_version}"
+
 
 @pytest.fixture(scope="session", autouse=True)
 def table_v2_appended_without_null_partitioned(session_catalog: Catalog, arrow_table_without_null: pa.Table) -> None:
@@ -243,11 +322,24 @@ def table_v2_appended_without_null_partitioned(session_catalog: Catalog, arrow_t
     assert tbl.format_version == 2, f"Expected v1, got: v{tbl.format_version}"
 
 
-# 4 table creation finished
+@pytest.fixture(scope="session", autouse=True)
+def table_v2_appended_with_null_partitioned(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v2_appended_with_null_partitioned"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(identifier=identifier, schema=TABLE_SCHEMA, properties={'format-version': '2'})
+
+    for _ in range(2):
+        tbl.append(arrow_table_with_null)
+
+    assert tbl.format_version == 2, f"Expected v1, got: v{tbl.format_version}"
 
 
-# working on
-@pytest.mark.integration
+@pytest.mark.adrian
 @pytest.mark.parametrize("col", TEST_DATA_WITHOUT_NULL.keys())
 @pytest.mark.parametrize("format_version", [1, 2])
 def test_query_filter_null(spark: SparkSession, col: str, format_version: int) -> None:
@@ -256,11 +348,29 @@ def test_query_filter_null(spark: SparkSession, col: str, format_version: int) -
     assert df.where(f"{col} is not null").count() == 3, f"Expected 3 rows for {col}"
 
 
-@pytest.mark.integration
+@pytest.mark.adrian
+@pytest.mark.parametrize("col", TEST_DATA_WITH_NULL.keys())
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_query_filter_null(spark: SparkSession, col: str, format_version: int) -> None:
+    identifier = f"default.arrow_table_v{format_version}_with_null_partitioned"
+    df = spark.table(identifier)
+    assert df.where(f"{col} is not null").count() == 3, f"Expected 3 rows for {col}"
+
+
+@pytest.mark.adrian
 @pytest.mark.parametrize("col", TEST_DATA_WITHOUT_NULL.keys())
 @pytest.mark.parametrize("format_version", [1, 2])
 def test_query_filter_appended_null_partitioned(spark: SparkSession, col: str, format_version: int) -> None:
     identifier = f"default.arrow_table_v{format_version}_appended_without_null_partitioned"
+    df = spark.table(identifier)
+    assert df.where(f"{col} is not null").count() == 6, f"Expected 6 rows for {col}"
+
+
+@pytest.mark.adrian
+@pytest.mark.parametrize("col", TEST_DATA_WITH_NULL.keys())
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_query_filter_appended_null_partitioned(spark: SparkSession, col: str, format_version: int) -> None:
+    identifier = f"default.arrow_table_v{format_version}_appended_with_null_partitioned"
     df = spark.table(identifier)
     assert df.where(f"{col} is not null").count() == 6, f"Expected 6 rows for {col}"
 
@@ -288,6 +398,33 @@ def table_v1_v2_appended_without_null(session_catalog: Catalog, arrow_table_with
         tx.upgrade_table_version(format_version=2)
 
     tbl.append(arrow_table_without_null)
+
+    assert tbl.format_version == 2, f"Expected v2, got: v{tbl.format_version}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def table_v1_v2_appended_with_null(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v1_v2_appended_with_null"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(
+        identifier=identifier,
+        schema=TABLE_SCHEMA,
+        partition_spec=PartitionSpec(PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="int")),
+        properties={'format-version': '1'},
+    )
+    tbl.append(arrow_table_with_null)
+
+    assert tbl.format_version == 1, f"Expected v1, got: v{tbl.format_version}"
+
+    with tbl.transaction() as tx:
+        tx.upgrade_table_version(format_version=2)
+
+    tbl.append(arrow_table_with_null)
 
     assert tbl.format_version == 2, f"Expected v2, got: v{tbl.format_version}"
 
@@ -326,15 +463,23 @@ def spark() -> SparkSession:
     return spark
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("col", TEST_DATA_without_null.keys())
+@pytest.mark.adrian
+@pytest.mark.parametrize("col", TEST_DATA_WITHOUT_NULL.keys())
 def test_query_filter_v1_v2_append_null(spark: SparkSession, col: str) -> None:
     identifier = "default.arrow_table_v1_v2_appended_without_null"
     df = spark.table(identifier)
     assert df.where(f"{col} is not null").count() == 6, f"Expected 3 row for {col}"
 
 
-@pytest.mark.integration
+@pytest.mark.adrian
+@pytest.mark.parametrize("col", TEST_DATA_WITH_NULL.keys())
+def test_query_filter_v1_v2_append_null(spark: SparkSession, col: str) -> None:
+    identifier = "default.arrow_table_v1_v2_appended_with_null"
+    df = spark.table(identifier)
+    assert df.where(f"{col} is not null").count() == 6, f"Expected 3 row for {col}"
+
+
+@pytest.mark.adrian
 def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_without_null: pa.Table) -> None:
     identifier = "default.arrow_table_summaries"
 
@@ -390,7 +535,63 @@ def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_wi
     }
 
 
-@pytest.mark.integration
+@pytest.mark.adrian
+def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_summaries"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+    tbl = session_catalog.create_table(
+        identifier=identifier,
+        schema=TABLE_SCHEMA,
+        partition_spec=PartitionSpec(PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="int")),
+        properties={'format-version': '2'},
+    )
+
+    tbl.append(arrow_table_with_null)
+    tbl.append(arrow_table_with_null)
+
+    rows = spark.sql(
+        f"""
+        SELECT operation, summary
+        FROM {identifier}.snapshots
+        ORDER BY committed_at ASC
+    """
+    ).collect()
+
+    operations = [row.operation for row in rows]
+    assert operations == ['append', 'append']
+
+    summaries = [row.summary for row in rows]
+
+    assert summaries[0] == {
+        'added-data-files': '2',
+        'added-files-size': '10433',
+        'added-records': '3',
+        'total-data-files': '2',
+        'total-delete-files': '0',
+        'total-equality-deletes': '0',
+        'total-files-size': '10433',
+        'total-position-deletes': '0',
+        'total-records': '3',
+    }
+
+    assert summaries[1] == {
+        'added-data-files': '2',
+        'added-files-size': '10433',
+        'added-records': '3',
+        'total-data-files': '4',
+        'total-delete-files': '0',
+        'total-equality-deletes': '0',
+        'total-files-size': '20866',
+        'total-position-deletes': '0',
+        'total-records': '6',
+    }
+
+
+@pytest.mark.adrian
 def test_data_files(spark: SparkSession, session_catalog: Catalog, arrow_table_without_null: pa.Table) -> None:
     identifier = "default.arrow_data_files"
 
@@ -425,8 +626,65 @@ def test_data_files(spark: SparkSession, session_catalog: Catalog, arrow_table_w
     assert [row.deleted_data_files_count for row in rows] == [0, 0, 0]
 
 
-@pytest.mark.integration
+
+@pytest.mark.adrian
+def test_data_files(spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_data_files"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+    tbl = session_catalog.create_table(
+        identifier=identifier,
+        schema=TABLE_SCHEMA,
+        partition_spec=PartitionSpec(PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="int")),
+        properties={'format-version': '1'},
+    )
+
+    tbl.append(arrow_table_with_null)
+    tbl.append(arrow_table_with_null)
+
+    # added_data_files_count, existing_data_files_count, deleted_data_files_count
+    rows = spark.sql(
+        f"""
+        SELECT added_data_files_count, existing_data_files_count, deleted_data_files_count
+        FROM {identifier}.all_manifests
+    """
+    ).collect()
+
+    assert [row.added_data_files_count for row in rows] == [2, 2, 2]
+    assert [row.existing_data_files_count for row in rows] == [
+        0,
+        0,
+        0,
+    ]
+    assert [row.deleted_data_files_count for row in rows] == [0, 0, 0]
+
+
+
+@pytest.mark.adrian
 def test_invalid_arguments(spark: SparkSession, session_catalog: Catalog, arrow_table_without_null: pa.Table) -> None:
+    identifier = "default.arrow_data_files"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(
+        identifier=identifier,
+        schema=TABLE_SCHEMA,
+        partition_spec=PartitionSpec(PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="int")),
+        properties={'format-version': '1'},
+    )
+
+    with pytest.raises(ValueError, match="Expected PyArrow table, got: not a df"):
+        tbl.append("not a df")
+
+
+@pytest.mark.adrian
+def test_invalid_arguments(spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
     identifier = "default.arrow_data_files"
 
     try:

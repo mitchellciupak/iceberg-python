@@ -308,6 +308,7 @@ def data_file_with_partition(partition_type: StructType, format_version: Literal
             field_id=field.field_id,
             name=field.name,
             field_type=partition_field_to_data_file_partition_field(field.field_type),
+            required=False
         )
         for field in partition_type.fields
     ])
@@ -727,6 +728,7 @@ class ManifestWriter(ABC):
         return manifest_entry_schema_with_data_file(format_version=format_version, data_file=data_file_type)
 
     def new_writer(self) -> AvroOutputFile[ManifestEntry]:
+        # print("xxxxxxxxxxxx!!!!!!", self._with_partition(self.version))
         return AvroOutputFile[ManifestEntry](
             output_file=self._output_file,
             file_schema=self._with_partition(self.version),
@@ -783,6 +785,7 @@ class ManifestWriter(ABC):
         ):
             self._min_data_sequence_number = entry.data_sequence_number
 
+        # print(f"{entry=}")
         self._writer.write_block([self.prepare_entry(entry)])
         return self
 
