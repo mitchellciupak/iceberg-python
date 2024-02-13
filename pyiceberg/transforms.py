@@ -151,9 +151,6 @@ class Transform(IcebergRootModel[str], ABC, Generic[S, T]):
     def satisfies_order_of(self, other: Any) -> bool:
         return self == other
 
-    def to_human_string(self, _: IcebergType, value: Optional[S]) -> str:
-        return str(value) if value is not None else "null"
-
     @property
     def dedup_name(self) -> str:
         return self.__str__()
@@ -530,7 +527,7 @@ class IdentityTransform(Transform[S, S]):
         return other.preserves_order
 
     def to_human_string(self, source_type: IcebergType, value: Optional[S]) -> str:
-        return _human_string(value, source_type) if value is not None else "null"
+        return _human_string(value, source_type)
 
     def __str__(self) -> str:
         """Return the string representation of the IdentityTransform class."""

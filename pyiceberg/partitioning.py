@@ -35,7 +35,7 @@ from typing_extensions import Annotated
 
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import Transform, parse_transform
-from pyiceberg.typedef import IcebergBaseModel
+from pyiceberg.typedef import IcebergBaseModel, Record
 from pyiceberg.types import NestedField, StructType
 
 INITIAL_PARTITION_SPEC_ID = 0
@@ -97,6 +97,7 @@ class PartitionSpec(IcebergBaseModel):
 
     spec_id: int = Field(alias="spec-id", default=INITIAL_PARTITION_SPEC_ID)
     fields: Tuple[PartitionField, ...] = Field(default_factory=tuple)
+    schema: Schema
 
     def __init__(
         self,
@@ -192,6 +193,24 @@ class PartitionSpec(IcebergBaseModel):
             result_type = field.transform.result_type(source_type)
             nested_fields.append(NestedField(field.field_id, field.name, result_type, required=False))
         return StructType(*nested_fields)
+
+    def partition_to_path(self, data: Record, schema: Schema) -> str:
+        partition_type = self.partition_type(schema)
+        field_types = partition_type.fields
+
+        pos = 0
+        field_strs = []
+        value_strs = []
+        for field_name in data._position_to_field_name:
+            value = getattr(data, field_name)
+
+            partition_field = self.fields[pos]  # partition field
+            value_str = partition_field.transform.to_human_string(source_type=field_types[pos].field_type, value=value)
+            value_strs.append(value_str)
+            field_strs.append(partition_field.name)
+            pos += 1
+        path = "/".join([field_str + "=" + value_str for field_str, value_str in zip(field_strs, value_strs)]).replace(":", "%3A")
+        return path
 
 
 UNPARTITIONED_PARTITION_SPEC = PartitionSpec(spec_id=0)

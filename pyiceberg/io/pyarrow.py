@@ -1723,7 +1723,7 @@ def write_file(table: Table, tasks: Iterator[WriteTask]) -> Iterator[DataFile]:
             content=DataFileContent.DATA,
             file_path=file_path,
             file_format=FileFormat.PARQUET,
-            partition=task.partition,
+            partition=task.partition_key.partition if task.partition_key else None,
             file_size_in_bytes=len(fo),
             # After this has been fixed:
             # https://github.com/apache/iceberg-python/issues/271
