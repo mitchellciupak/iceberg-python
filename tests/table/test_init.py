@@ -17,12 +17,27 @@
 # pylint:disable=redefined-outer-name
 import uuid
 from copy import copy
-from typing import Any, Dict
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import pyarrow as pa
 import pytest
 from pydantic import ValidationError
 from sortedcontainers import SortedList
+import re
 
 from pyiceberg.catalog.noop import NoopCatalog
 from pyiceberg.exceptions import CommitFailedException
@@ -67,6 +82,10 @@ from pyiceberg.table import (
     _TableMetadataUpdateContext,
     update_table_metadata,
     verify_table_already_sorted,
+    _fetch_fields_and_validate_expression_type,
+    _validate_static_overwrite_filter_field,
+    _check_schema,
+    # _validate_static_overwrite_filter
 )
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadataUtil, TableMetadataV2, _generate_snapshot_id
 from pyiceberg.table.snapshots import (
@@ -81,7 +100,7 @@ from pyiceberg.table.sorting import (
     SortField,
     SortOrder,
 )
-from pyiceberg.transforms import BucketTransform, IdentityTransform
+from pyiceberg.transforms import BucketTransform, IdentityTransform, TruncateTransform
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -1012,6 +1031,338 @@ def test_correct_schema() -> None:
         _ = t.scan(snapshot_id=-1).projection()
 
     assert "Snapshot not found: -1" in str(exc_info.value)
+
+from pyiceberg.expressions import (
+    AlwaysFalse,
+    AlwaysTrue,
+    And,
+    BooleanExpression,
+    BoundEqualTo,
+    BoundGreaterThan,
+    BoundGreaterThanOrEqual,
+    BoundIn,
+    BoundIsNaN,
+    BoundIsNull,
+    BoundLessThan,
+    BoundLessThanOrEqual,
+    BoundNotEqualTo,
+    BoundNotIn,
+    BoundNotNaN,
+    BoundNotNull,
+    BoundReference,
+    EqualTo,
+    GreaterThan,
+    GreaterThanOrEqual,
+    In,
+    IsNaN,
+    IsNull,
+    LessThan,
+    LessThanOrEqual,
+    Not,
+    NotEqualTo,
+    NotIn,
+    NotNaN,
+    NotNull,
+    Or,
+    Reference,
+    UnboundPredicate,
+)
+
+
+#_validate_static_overwrite_filter_field
+@pytest.mark.french
+def test__validate_static_overwrite_filter_field_fail_on_non_schema_fields_in_filter()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
+    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+    test_schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    pred = EqualTo(Reference("not a field"), "hello")
+    partition_spec=PartitionSpec(
+        PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="test_part_col")
+    )
+    with pytest.raises(ValueError, match=f"Could not find field with name {pred.term.name}, case_sensitive=True"):
+        _validate_static_overwrite_filter_field(field=pred, table_schema=test_schema, spec=partition_spec)
+
+
+@pytest.mark.french
+def test__validate_static_overwrite_filter_field_fail_on_non_part_fields_in_filter()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
+    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+    test_schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    pred = EqualTo(Reference("foo"), "hello")
+    partition_spec=PartitionSpec(
+        PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar")
+    )
+    import re
+    with pytest.raises(ValueError, match=re.escape("get len(part_fields)=0, not 1, if this number is 0, indicating the static filter is not within the partition fields, which is invalid")):
+        _validate_static_overwrite_filter_field(field=pred, table_schema=test_schema, spec=partition_spec)
+
+#to do add one test that the partition fields passed
+@pytest.mark.french
+def test__validate_static_overwrite_filter_field_fail_on_non_identity_transorm_filter()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
+    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+    test_schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    pred = EqualTo(Reference("foo"), "hello")
+    partition_spec=PartitionSpec(
+        PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
+        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc")
+    )
+    # import re
+    with pytest.raises(ValueError, match="static overwrite partition filter can only apply to partition fields which are without hidden transform, but get.*"):
+        _validate_static_overwrite_filter_field(field=pred, table_schema=test_schema, spec=partition_spec)
+
+# combine this with above
+@pytest.mark.french
+def test__validate_static_overwrite_filter_field_succeed_on_an_identity_field_although_table_has_hidden_partition()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
+    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+    test_schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    pred = EqualTo(Reference("bar"), 3)
+    partition_spec=PartitionSpec(
+        PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
+        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc")
+    )
+    # import re
+    #with pytest.raises(ValueError, match="static overwrite partition filter can only apply to partition fields which are without hidden transform, but get.*"):
+    _validate_static_overwrite_filter_field(field=pred, table_schema=test_schema, spec=partition_spec)
+
+@pytest.mark.french
+def test__validate_static_overwrite_filter_field_fail_to_bind()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
+    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+    test_schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    pred = EqualTo(Reference("bar"), "an incompatible type")
+    partition_spec=PartitionSpec(
+        PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
+        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc")
+    )
+    with pytest.raises(ValueError, match="Could not convert an incompatible type into a int"):
+        _validate_static_overwrite_filter_field(field=pred, table_schema=test_schema, spec=partition_spec)
+
+# # to do, raises should use full match to check whether it is overlapping error or it is unioning error
+# # to do, in the raw code and test, should add that filter is not conflicting with itself,, e.g. the same field can only be referenced once 
+# # advanced: as long as the values are different
+# # as to do, a filter can and a same expr multiple times
+# @pytest.mark.integration
+# @pytest.mark.parametrize(
+#     "task_field_names, eq_to_fields_names, null_field_names, schema_field_names, raises", 
+#     [
+#         # good case
+#         (["f1"], ["f2"], ["f3"], ["f1", "f2", "f3"], False),
+#         # filter has overlapping fields with arrow fields
+#         (["f1", "f2"], ["f2"], ["f3"], ["f1", "f2", "f3"], True),
+#         (["f1", "f2"], ["f3"], ["f1"], ["f1", "f2", "f3"], True),
+#         # filter has one field referenced multiple times
+#         #(["f1", "f2"], ["f3"], ["f3"], ["f1", "f2", "f3"], True),
+#         #(["f1", "f2"], ["f3, f3"], ["f4"], ["f1", "f2", "f3", "f4"], True),
+#         #(["f1", "f2"], ["f4"], ["f3, f3"], ["f1", "f2", "f3", "f4"], True),
+#         # shortage
+#         (["f1"], ["f2"], ["f3"], ["f1", "f2", "f3", "f4"], True),
+#     ]
+# )
+# def test__validate_mutual_exclusive_and_union(task_field_names, eq_to_fields_names, null_field_names, schema_field_names, raises):
+#     if raises:
+#         with pytest.raises(ValueError): # match=expected): to do
+#             _check_schema(task_field_names, eq_to_fields_names, null_field_names, schema_field_names)
+#     else:
+#         _check_schema(task_field_names, eq_to_fields_names, null_field_names, schema_field_names)
+
+# to do the truncated is sorted or not? arrow table schema does not have to match exactly in order right while now it has to be in order.
+@pytest.mark.french
+def test__validate_mutual_exclusive_and_union_succeed():
+    table_schema: Schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    other_schema: pa.Schema = pa.schema([
+        pa.field('foo', pa.string()),
+        pa.field('baz', pa.bool_()),
+        # pa.field('name', pa.string()),
+        # pa.field('age', pa.int32()),
+        # pa.field('email', pa.string()),
+        # pa.field('is_subscribed', pa.bool_())
+    ])
+    print(f"{other_schema=}")
+    # pa.schema([
+    #     pa.field("foo", pa.string(), nullable=False),
+    #     pa.field("bar", pa.int32(), nullable=True),
+    #     pa.field("baz", pa.bool_(), nullable=True),
+    # ])
+
+    null_nested_fields: List[NestedField] = []
+    eq_to_nested_fields: List[NestedField] = [NestedField(field_id=2, name="bar", field_type=IntegerType(), required=False)]
+    _check_schema(table_schema, other_schema, null_nested_fields, eq_to_nested_fields)
+
+# to do rename: with filter
+@pytest.mark.french 
+def test__validate_mutual_exclusive_and_union_with_filter_fail_on_missing_field():
+    table_schema: Schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    other_schema: pa.Schema = pa.schema([
+        pa.field('baz', pa.bool_()),
+    ])
+
+    null_nested_fields: List[NestedField] = []
+    eq_to_nested_fields: List[NestedField] = [NestedField(field_id=2, name="bar", field_type=IntegerType(), required=False)]
+    
+    expected = re.escape('''With partition fields in static overwrite filter as ['bar'], mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field                        ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ❌ │ 1: foo: optional string  │ Missing                                │
+│ ✅ │ 2: bar: required int     │ Appears in filter but not arrow table. │
+│ ✅ │ 3: baz: optional boolean │ 3: baz: optional boolean               │
+└────┴──────────────────────────┴────────────────────────────────────────┘
+''')
+    with pytest.raises(ValueError, match=expected):
+            _check_schema(table_schema, other_schema, null_nested_fields, eq_to_nested_fields)
+
+@pytest.mark.french
+def test__validate_mutual_exclusive_and_union_with_filter_fail_on_nullability_mismatch():
+    table_schema: Schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    other_schema: pa.Schema = pa.schema([
+        pa.field('foo', pa.string()),
+        pa.field('bar', pa.int32()),
+    ])
+
+
+    null_nested_fields: List[NestedField] = []
+    eq_to_nested_fields: List[NestedField] = [NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False)]
+    expected = re.escape('''With partition fields in static overwrite filter as ['baz'], mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field                        ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional string  │ 1: foo: optional string                │
+│ ❌ │ 2: bar: required int     │ 2: bar: optional int                   │
+│ ✅ │ 3: baz: optional boolean │ Appears in filter but not arrow table. │
+└────┴──────────────────────────┴────────────────────────────────────────┘
+''')
+    with pytest.raises(ValueError, match=expected):
+            _check_schema(table_schema, other_schema, null_nested_fields, eq_to_nested_fields)
+
+@pytest.mark.french
+def test__validate_mutual_exclusive_and_union_with_filter_fail_on_type_mismatch():
+    table_schema: Schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    other_schema: pa.Schema = pa.schema([
+        pa.field('foo', pa.string()),
+        pa.field('bar', pa.string(), nullable=False),
+    ])
+
+    null_nested_fields: List[NestedField] = []
+    eq_to_nested_fields: List[NestedField] = [NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False)]
+    expected = re.escape('''With partition fields in static overwrite filter as ['baz'], mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field                        ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional string  │ 1: foo: optional string                │
+│ ❌ │ 2: bar: required int     │ 2: bar: required string                │
+│ ✅ │ 3: baz: optional boolean │ Appears in filter but not arrow table. │
+└────┴──────────────────────────┴────────────────────────────────────────┘
+''')
+    with pytest.raises(ValueError, match=expected):
+        _check_schema(table_schema, other_schema, null_nested_fields, eq_to_nested_fields)
+
+
+@pytest.mark.french
+def test__validate_mutual_exclusive_and_union_with_field_appear_in_both_filter_and_dataframe():
+    table_schema: Schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    other_schema: pa.Schema = pa.schema([
+        pa.field('foo', pa.string()),
+        pa.field('bar', pa.int32(), nullable=False),
+    ])
+
+    null_nested_fields: List[NestedField] = [NestedField(field_id=1, name="foo", field_type=StringType(), required=False)]
+    eq_to_nested_fields: List[NestedField] = [NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False)]
+    expected = re.escape('''With partition fields in static overwrite filter as ['foo', 'baz'], mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field                         ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ❌ │ 1: foo: optional string  │ Appears in both filter and arrow table. │
+│ ✅ │ 2: bar: required int     │ 2: bar: required int                    │
+│ ✅ │ 3: baz: optional boolean │ Appears in filter but not arrow table.  │
+└────┴──────────────────────────┴─────────────────────────────────────────┘
+''')
+    with pytest.raises(ValueError, match=expected):
+        _check_schema(table_schema, other_schema, null_nested_fields, eq_to_nested_fields)
+
+
+# to do, add tests for bind value failure??????
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "pred, raises, is_null_list, eq_to_list", 
+    [
+        (EqualTo(Reference("foo"), "hello"), False, [], [EqualTo(Reference("foo"), "hello")]),
+        (IsNull(Reference("foo")), False, [IsNull(Reference("foo"))], []),
+        (And(IsNull(Reference("foo")),EqualTo(Reference("foo"), "hello")), False, [IsNull(Reference("foo"))], [EqualTo(Reference("foo"), "hello")]),
+        (NotNull, True, [], []),
+        (NotEqualTo, True, [], []),
+        (LessThan(Reference("foo"), 5), True, [], []),
+        (Or(IsNull(Reference("foo")),EqualTo(Reference("foo"), "hello")), True, [], []),
+        (And(EqualTo(Reference("foo"), "hello"), And(IsNull(Reference("foo")), EqualTo(Reference("boo"), "hello"))), False, [IsNull(Reference("foo"))], [EqualTo(Reference("foo"), "hello"), EqualTo(Reference("boo"), "hello")]),
+    ],
+)
+def test__fetch_fields_and_validate_expression_type(pred, raises, is_null_list, eq_to_list)-> None:
+    if raises:
+        with pytest.raises(ValueError): # match=expected): to do
+            res = _fetch_fields_and_validate_expression_type(pred)
+    else:
+        res = _fetch_fields_and_validate_expression_type(pred)
+        print(f":::::::::::::adrian, {res=}")
+        print(f"lets check the strings, {set([str(e) for e in res[1]])=}")
+        assert set([str(e) for e in res[0]]) == set([str(e) for e in is_null_list])
+        assert set([str(e) for e in res[1]]) == set([str(e) for e in eq_to_list])
+
 
 
 def test_schema_mismatch_type(table_schema_simple: Schema) -> None:
