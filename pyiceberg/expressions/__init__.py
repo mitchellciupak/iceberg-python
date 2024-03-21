@@ -383,6 +383,10 @@ class UnaryPredicate(UnboundPredicate[Any], ABC):
     @abstractmethod
     def as_bound(self) -> Type[BoundUnaryPredicate[Any]]: ...
 
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+
 
 class BoundUnaryPredicate(BoundPredicate[L], ABC):
     def __repr__(self) -> str:
@@ -697,6 +701,9 @@ class LiteralPredicate(UnboundPredicate[L], ABC):
     @property
     @abstractmethod
     def as_bound(self) -> Type[BoundLiteralPredicate[L]]: ...
+
+    def __hash__(self) -> int:
+        return hash(str(self))
 
 
 class BoundLiteralPredicate(BoundPredicate[L], ABC):
