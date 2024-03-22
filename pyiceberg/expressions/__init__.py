@@ -373,7 +373,10 @@ class UnboundPredicate(Generic[L], Unbound[BooleanExpression], BooleanExpression
 class UnaryPredicate(UnboundPredicate[Any], ABC):
     def bind(self, schema: Schema, case_sensitive: bool = True) -> BoundUnaryPredicate[Any]:
         bound_term = self.term.bind(schema, case_sensitive)
-        return self.as_bound(bound_term)
+        print(f"{bound_term=}")
+        res = self.as_bound(bound_term)
+        print(f"{res=}")
+        return res
 
     def __repr__(self) -> str:
         """Return the string representation of the UnaryPredicate class."""
@@ -384,8 +387,8 @@ class UnaryPredicate(UnboundPredicate[Any], ABC):
     def as_bound(self) -> Type[BoundUnaryPredicate[Any]]: ...
 
     def __hash__(self) -> int:
+        """Return hash value of the UnaryPredicate class."""
         return hash(str(self))
-
 
 
 class BoundUnaryPredicate(BoundPredicate[L], ABC):
@@ -415,6 +418,10 @@ class BoundIsNull(BoundUnaryPredicate[L]):
     @property
     def as_unbound(self) -> Type[IsNull]:
         return IsNull
+
+    def __hash__(self) -> int:
+        """Return hash value of the BoundIsNull class."""
+        return hash(str(self))
 
 
 class BoundNotNull(BoundUnaryPredicate[L]):
@@ -703,6 +710,7 @@ class LiteralPredicate(UnboundPredicate[L], ABC):
     def as_bound(self) -> Type[BoundLiteralPredicate[L]]: ...
 
     def __hash__(self) -> int:
+        """Return hash value of the UnaryPredicate class."""
         return hash(str(self))
 
 
@@ -737,6 +745,10 @@ class BoundEqualTo(BoundLiteralPredicate[L]):
     @property
     def as_unbound(self) -> Type[EqualTo[L]]:
         return EqualTo
+
+    def __hash__(self) -> int:
+        """Return hash value of the BoundEqualTo class."""
+        return hash(str(self))
 
 
 class BoundNotEqualTo(BoundLiteralPredicate[L]):

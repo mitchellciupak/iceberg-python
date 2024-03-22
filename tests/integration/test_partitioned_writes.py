@@ -446,7 +446,7 @@ def test_summaries_with_null(spark: SparkSession, session_catalog: Catalog, arro
     tbl.overwrite(arrow_table_with_null)
     tbl.append(arrow_table_with_null)
     valid_arrow_table_with_null_to_overwrite = arrow_table_with_null.drop(['int'])
-    tbl.overwrite(valid_arrow_table_with_null_to_overwrite,  overwrite_filter="int=1")
+    tbl.overwrite(valid_arrow_table_with_null_to_overwrite, overwrite_filter="int=1")
 
     rows = spark.sql(
         f"""
@@ -550,7 +550,7 @@ def test_data_files_with_table_partitioned_with_null(
     tbl.append(arrow_table_with_null)
 
     valid_arrow_table_with_null_to_overwrite = arrow_table_with_null.drop(['int'])
-    tbl.overwrite(valid_arrow_table_with_null_to_overwrite,  overwrite_filter="int=1")
+    tbl.overwrite(valid_arrow_table_with_null_to_overwrite, overwrite_filter="int=1")
 
     # first append links to 1 manifest file (M1)
     # second append's manifest list links to  2 manifest files (M1, M2)
@@ -672,24 +672,19 @@ def test_query_filter_after_append_overwrite_table_with_expr(
         properties={'format-version': '1'},
     )
 
-    
-    for i in range(3):
+    for _ in range(3):
         tbl.append(arrow_table_with_null)
-        print("this is ", i)
         spark.sql(f"refresh table {identifier}")
         spark.sql(f"select file_path from {identifier}.files").show(20, False)
         spark.sql(f"select * from {identifier}").show(20, False)
-
 
     valid_arrow_table_with_null_to_overwrite = arrow_table_with_null.drop([part_col])
     tbl.overwrite(valid_arrow_table_with_null_to_overwrite, expr)
 
     iceberg_table = session_catalog.load_table(identifier=identifier)
     spark.sql(f"refresh table {identifier}")
-    print("this is 3")
     spark.sql(f"select file_path from {identifier}.files").show(20, False)
     spark.sql(f"select * from {identifier}").show(20, False)
-    
+
     assert iceberg_table.scan().to_arrow().num_rows == 9
     assert iceberg_table.scan(row_filter=expr).to_arrow().num_rows == 3
-    

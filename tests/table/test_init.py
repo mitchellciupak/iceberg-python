@@ -15,37 +15,32 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint:disable=redefined-outer-name
+import re
 import uuid
 from copy import copy
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    Generic,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Tuple,
-    TypeVar,
-    Union,
-)
+from typing import Any, Dict, Set, Union
 
 import pyarrow as pa
 import pytest
 from pydantic import ValidationError
 from sortedcontainers import SortedList
-import re
 
 from pyiceberg.catalog.noop import NoopCatalog
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.expressions import (
     AlwaysTrue,
     And,
+    BoundEqualTo,
+    BoundIsNull,
+    BoundPredicate,
     EqualTo,
     In,
+    IsNull,
+    LessThan,
+    NotEqualTo,
+    NotNull,
+    Or,
+    Reference,
 )
 from pyiceberg.io import PY_IO_IMPL, load_file_io
 from pyiceberg.manifest import (
@@ -77,15 +72,14 @@ from pyiceberg.table import (
     Table,
     UpdateSchema,
     _apply_table_update,
+    _bind_and_validate_static_overwrite_filter_predicate,
     _check_schema,
+    _fill_in_df,
     _match_deletes_to_data_file,
     _TableMetadataUpdateContext,
+    _validate_static_overwrite_filter_expr_type,
     update_table_metadata,
     verify_table_already_sorted,
-    _validate_static_overwrite_filter_expr_type,
-    _validate_static_overwrite_filter_field,
-    _check_schema,
-    _fill_in_df
 )
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadataUtil, TableMetadataV2, _generate_snapshot_id
 from pyiceberg.table.snapshots import (
@@ -101,6 +95,7 @@ from pyiceberg.table.sorting import (
     SortOrder,
 )
 from pyiceberg.transforms import BucketTransform, IdentityTransform, TruncateTransform
+from pyiceberg.typedef import L
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -1032,46 +1027,9 @@ def test_correct_schema() -> None:
 
     assert "Snapshot not found: -1" in str(exc_info.value)
 
-from pyiceberg.expressions import (
-    AlwaysFalse,
-    AlwaysTrue,
-    And,
-    BooleanExpression,
-    BoundEqualTo,
-    BoundGreaterThan,
-    BoundGreaterThanOrEqual,
-    BoundIn,
-    BoundIsNaN,
-    BoundIsNull,
-    BoundLessThan,
-    BoundLessThanOrEqual,
-    BoundNotEqualTo,
-    BoundNotIn,
-    BoundNotNaN,
-    BoundNotNull,
-    BoundReference,
-    EqualTo,
-    GreaterThan,
-    GreaterThanOrEqual,
-    In,
-    IsNaN,
-    IsNull,
-    LessThan,
-    LessThanOrEqual,
-    Not,
-    NotEqualTo,
-    NotIn,
-    NotNaN,
-    NotNull,
-    Or,
-    Reference,
-    UnboundPredicate,
-)
 
-
-#_validate_static_overwrite_filter_field
-def test__validate_static_overwrite_filter_field_fail_on_non_schema_fields_in_filter()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
-    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+# _bind_and_validate_static_overwrite_filter_predicate
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_schema_fields_in_filter() -> None:
     test_schema = Schema(
         NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
         NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
@@ -1080,64 +1038,53 @@ def test__validate_static_overwrite_filter_field_fail_on_non_schema_fields_in_fi
         identifier_field_ids=[2],
     )
     pred = EqualTo(Reference("not a field"), "hello")
-    partition_spec=PartitionSpec(
+    partition_spec = PartitionSpec(
         PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="test_part_col")
     )
-    with pytest.raises(ValueError, match=f"Could not find field with name {pred.term.name}, case_sensitive=True"):
-        _validate_static_overwrite_filter_field(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
-
-@pytest.mark.zy
-def test_mine(table_schema_simple) -> None:
-    pred = IsNull(Reference("bar"))
-    pred.bind(table_schema_simple)
-    print("xxx", pred.term.name)
-
-    from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
-    pa_table = pa.table(
-        {"bar": [1, 2, 3], "foo": ["a", "b", "c"],  "baz": [True, False, None]},
-    )
-    name_mapping = table_schema_simple.name_mapping
-    print("xxxx!", pyarrow_to_schema(pa_table.schema, name_mapping=name_mapping))
+    with pytest.raises(ValueError, match="Could not find field with name not a field, case_sensitive=True"):
+        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
 
 
-def test__fill_in_df(table_schema_simple) -> None:
-    df = pa.table(
-        {"baz": [True, False, None]}
-    )
+# @pytest.mark.zy
+# def test_mine(table_schema_simple) -> None:
+#     pred = IsNull("bar")
+#     print("xxxx!", pred.term)
+#     pred.bind(table_schema_simple)
+
+
+#     from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
+#     pa_table = pa.table(
+#         {"bar": [1, 2, 3], "foo": ["a", "b", "c"],  "baz": [True, False, None]},
+#     )
+#     name_mapping = table_schema_simple.name_mapping
+#     print("xxxx!", pyarrow_to_schema(pa_table.schema, name_mapping=name_mapping))
+
+
+def test__fill_in_df(table_schema_simple: Schema) -> None:
+    df = pa.table({"baz": [True, False, None]})
     unbound_is_null_predicates = [IsNull(Reference("foo"))]
     unbound_eq_to_predicates = [EqualTo(Reference("bar"), 3)]
-    bound_is_null_predicates = [unbound_predicate.bind(table_schema_simple) for unbound_predicate in unbound_is_null_predicates]
-    bound_eq_to_predicates = [unbound_predicate.bind(table_schema_simple) for unbound_predicate in unbound_eq_to_predicates]
-    filled_df = _fill_in_df(df = df, bound_is_null_predicates = bound_is_null_predicates, bound_eq_to_predicates = bound_eq_to_predicates)
-    print(f"{filled_df=}")
+    bound_is_null_predicates: Set[BoundIsNull[Any]] = {
+        unbound_predicate.bind(table_schema_simple)  # type: ignore  # because bind returns super type and python could not downcast implicitly using type annotation
+        for unbound_predicate in unbound_is_null_predicates
+    }
+    bound_eq_to_predicates: Set[BoundEqualTo[Any]] = {
+        unbound_predicate.bind(table_schema_simple)  # type: ignore  # because bind returns super type and python could not downcast implicitly using type annotation
+        for unbound_predicate in unbound_eq_to_predicates
+    }
+    filled_df = _fill_in_df(
+        df=df,
+        bound_is_null_predicates=bound_is_null_predicates,
+        bound_eq_to_predicates=bound_eq_to_predicates,
+    )
     expected = pa.table(
-        {
-            "baz": [True, False, None],
-            "foo": [None, None, None],
-            "bar": [3,3,3]
-        }, schema=pa.schema([pa.field('baz', pa.bool_()), pa.field('foo', pa.string()), pa.field('bar', pa.int32())]))
+        {"baz": [True, False, None], "foo": [None, None, None], "bar": [3, 3, 3]},
+        schema=pa.schema([pa.field('baz', pa.bool_()), pa.field('foo', pa.string()), pa.field('bar', pa.int32())]),
+    )
     assert filled_df == expected
 
-def test__validate_static_overwrite_filter_field_fail_on_non_part_fields_in_filter()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
-    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
-    pred = EqualTo(Reference("foo"), "hello")
-    partition_spec=PartitionSpec(
-        PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar")
-    )
-    import re
-    with pytest.raises(ValueError, match=re.escape("get len(part_fields)=0, not 1, if this number is 0, indicating the static filter is not within the partition fields, which is invalid")):
-        _validate_static_overwrite_filter_field(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
 
-#to do add one test that the partition fields passed
-def test__validate_static_overwrite_filter_field_fail_on_non_identity_transorm_filter()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
-    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_part_fields_in_filter() -> None:
     test_schema = Schema(
         NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
         NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
@@ -1146,17 +1093,42 @@ def test__validate_static_overwrite_filter_field_fail_on_non_identity_transorm_f
         identifier_field_ids=[2],
     )
     pred = EqualTo(Reference("foo"), "hello")
-    partition_spec=PartitionSpec(
+    partition_spec = PartitionSpec(PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"))
+    import re
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Get 0 partition fields from filter predicate EqualTo(term=Reference(name='foo'), literal=literal('hello')), expecting 1."
+        ),
+    ):
+        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+
+
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_identity_transorm_filter() -> None:
+    test_schema = Schema(
+        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
+        schema_id=1,
+        identifier_field_ids=[2],
+    )
+    pred = EqualTo(Reference("foo"), "hello")
+    partition_spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
-        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc")
+        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc"),
     )
     # import re
-    with pytest.raises(ValueError, match="static overwrite partition filter can only apply to partition fields which are without hidden transform, but get.*"):
-        _validate_static_overwrite_filter_field(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+    with pytest.raises(
+        ValueError,
+        match="static overwrite partition filter can only apply to partition fields which are without hidden transform, but get.*",
+    ):
+        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
 
-# combine this with above
-def test__validate_static_overwrite_filter_field_succeed_on_an_identity_field_although_table_has_hidden_partition()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
-    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+
+def test__bind_and_validate_static_overwrite_filter_predicate_succeeds_on_an_identity_transform_field_although_table_has_other_hidden_partition_fields() -> (
+    None
+):
     test_schema = Schema(
         NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
         NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
@@ -1165,17 +1137,15 @@ def test__validate_static_overwrite_filter_field_succeed_on_an_identity_field_al
         identifier_field_ids=[2],
     )
     pred = EqualTo(Reference("bar"), 3)
-    partition_spec=PartitionSpec(
+    partition_spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
-        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc")
+        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc"),
     )
-    # import re
-    #with pytest.raises(ValueError, match="static overwrite partition filter can only apply to partition fields which are without hidden transform, but get.*"):
-    _validate_static_overwrite_filter_field(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+
+    _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
 
 
-def test__validate_static_overwrite_filter_field_fail_to_bind()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
-    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_to_bind() -> None:
     test_schema = Schema(
         NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
         NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
@@ -1184,16 +1154,15 @@ def test__validate_static_overwrite_filter_field_fail_to_bind()-> None: #pred: B
         identifier_field_ids=[2],
     )
     pred = EqualTo(Reference("bar"), "an incompatible type")
-    partition_spec=PartitionSpec(
+    partition_spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
-        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc")
+        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc"),
     )
     with pytest.raises(ValueError, match="Could not convert an incompatible type into a int"):
-        _validate_static_overwrite_filter_field(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
 
 
-def test__validate_static_overwrite_filter_field_fail_to_bind_due_to_non_nullable()-> None: #pred: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> None:
-    # todo: is it possible to make boolean expression more specific, like bound expression? no it is not bound yet
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_to_bind_due_to_non_nullable() -> None:
     test_schema = Schema(
         NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
         NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
@@ -1202,67 +1171,60 @@ def test__validate_static_overwrite_filter_field_fail_to_bind_due_to_non_nullabl
         identifier_field_ids=[2],
     )
     pred = IsNull(Reference("bar"))
-    partition_spec=PartitionSpec(
+    partition_spec = PartitionSpec(
         PartitionField(source_id=3, field_id=1001, transform=IdentityTransform(), name="baz"),
-        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc")
+        PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc"),
     )
-    with pytest.raises(ValueError, match=re.escape("Static overwriting with part of the explicit partition filter not meaningful (e.g. specifing a non-nullable partition field to be null)")):
-        _validate_static_overwrite_filter_field(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "Static overwriting with part of the explicit partition filter not meaningful (specifing a non-nullable partition field to be null)"
+        ),
+    ):
+        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
 
 
-
-
-def test__check_schema_with_filter_succeed():
-    table_schema: Schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+def test__check_schema_with_filter_succeed(iceberg_schema_simple: Schema) -> None:
     other_schema: pa.Schema = pa.schema([
         pa.field('foo', pa.string()),
         pa.field('baz', pa.bool_()),
     ])
 
     unbound_preds = [EqualTo(Reference("bar"), 15)]
-    filter_predicates = [pred.bind(table_schema) for pred in unbound_preds]
-    _check_schema(table_schema, other_schema, filter_predicates = filter_predicates)
+    filter_predicates: Set[BoundPredicate[int]] = {pred.bind(iceberg_schema_simple) for pred in unbound_preds}
+    # upcast set[BoundLiteralPredicate[int]] to set[BoundPredicate[int]]
+    # because _check_schema expects set[BoundPredicate[int]] and set is not covariant
+    # (meaning although BoundLiteralPredicate is subclass of BoundPredicate, list[BoundLiteralPredicate] is not that of list[BoundPredicate])
+    _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
-def test__check_schema_with_filter_succeed_on_pyarrow_table_with_random_column_order() -> None:
-    table_schema: Schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+
+def test__check_schema_with_filter_succeed_on_pyarrow_table_with_random_column_order(iceberg_schema_simple: Schema) -> None:
     other_schema: pa.Schema = pa.schema([
         pa.field('baz', pa.bool_()),
         pa.field('foo', pa.string()),
     ])
 
     unbound_preds = [EqualTo(Reference("bar"), 15)]
-    filter_predicates = [pred.bind(table_schema) for pred in unbound_preds]
-    _check_schema(table_schema, other_schema, filter_predicates = filter_predicates)
+    filter_predicates: Set[BoundPredicate[int]] = {pred.bind(iceberg_schema_simple) for pred in unbound_preds}
+    # upcast set[BoundLiteralPredicate[int]] to set[BoundPredicate[int]]
+    # because _check_schema expects set[BoundPredicate[int]] and set is not covariant
+    # (meaning although BoundLiteralPredicate is subclass of BoundPredicate, list[BoundLiteralPredicate] is not that of list[BoundPredicate])
+    _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
-def test__check_schema_with_filter_fail_on_missing_field():
-    table_schema: Schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+def test__check_schema_with_filter_fails_on_missing_field(iceberg_schema_simple: Schema) -> None:
     other_schema: pa.Schema = pa.schema([
         pa.field('baz', pa.bool_()),
     ])
 
     unbound_preds = [EqualTo(Reference("bar"), 15)]
-    filter_predicates = [pred.bind(table_schema) for pred in unbound_preds]
+    filter_predicates: Set[BoundPredicate[int]] = {pred.bind(iceberg_schema_simple) for pred in unbound_preds}
+    # upcast set[BoundLiteralPredicate[int]] to set[BoundPredicate[int]]
+    # because _check_schema expects set[BoundPredicate[int]] and set is not covariant
+    # (meaning although BoundLiteralPredicate is subclass of BoundPredicate, list[BoundLiteralPredicate] is not that of list[BoundPredicate])
 
-    expected = re.escape('''Mismatch in fields:
+    expected = re.escape(
+        """Mismatch in fields:
 ┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃    ┃ Table field              ┃ Dataframe field          ┃ Overwrite filter field ┃
 ┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━┩
@@ -1270,28 +1232,25 @@ def test__check_schema_with_filter_fail_on_missing_field():
 │ ✅ │ 2: bar: required int     │ N/A                      │ bar                    │
 │ ✅ │ 3: baz: optional boolean │ 3: baz: optional boolean │ N/A                    │
 └────┴──────────────────────────┴──────────────────────────┴────────────────────────┘
-''')
-    with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema, other_schema, filter_predicates = filter_predicates)
-
-
-
-def test__check_schema_with_filter_fail_on_nullability_mismatch():
-    table_schema: Schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
+"""
     )
+    with pytest.raises(ValueError, match=expected):
+        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+
+
+def test__check_schema_with_filter_fails_on_nullability_mismatch(iceberg_schema_simple: Schema) -> None:
     other_schema: pa.Schema = pa.schema([
         pa.field('foo', pa.string()),
         pa.field('bar', pa.int32()),
     ])
 
     unbound_preds = [EqualTo(Reference("baz"), True)]
-    filter_predicates = [pred.bind(table_schema) for pred in unbound_preds]
-    expected = re.escape('''Mismatch in fields:
+    filter_predicates: Set[BoundPredicate[bool]] = {pred.bind(iceberg_schema_simple) for pred in unbound_preds}
+    # upcast set[BoundLiteralPredicate[bool]] to set[BoundPredicate[bool]]
+    # because _check_schema expects set[BoundPredicate[bool]] and set is not covariant
+    # (meaning although BoundLiteralPredicate is subclass of BoundPredicate, list[BoundLiteralPredicate] is not that of list[BoundPredicate])
+    expected = re.escape(
+        """Mismatch in fields:
 ┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃    ┃ Table field              ┃ Dataframe field         ┃ Overwrite filter field ┃
 ┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━┩
@@ -1299,27 +1258,25 @@ def test__check_schema_with_filter_fail_on_nullability_mismatch():
 │ ❌ │ 2: bar: required int     │ 2: bar: optional int    │ N/A                    │
 │ ✅ │ 3: baz: optional boolean │ N/A                     │ baz                    │
 └────┴──────────────────────────┴─────────────────────────┴────────────────────────┘
-''')
-    with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema, other_schema, filter_predicates = filter_predicates)
-
-
-def test__check_schema_with_filter_fail_on_type_mismatch():
-    table_schema: Schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
+"""
     )
+    with pytest.raises(ValueError, match=expected):
+        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+
+
+def test__check_schema_with_filter_fails_on_type_mismatch(iceberg_schema_simple: Schema) -> None:
     other_schema: pa.Schema = pa.schema([
         pa.field('foo', pa.string()),
         pa.field('bar', pa.string(), nullable=False),
     ])
 
     unbound_preds = [EqualTo(Reference("baz"), True)]
-    filter_predicates = [pred.bind(table_schema) for pred in unbound_preds]
-    expected = re.escape('''Mismatch in fields:
+    filter_predicates: Set[BoundPredicate[bool]] = {pred.bind(iceberg_schema_simple) for pred in unbound_preds}
+    # upcast set[BoundLiteralPredicate[bool]] to set[BoundPredicate[bool]]
+    # because _check_schema expects set[BoundPredicate[bool]] and set is not covariant
+    # (meaning although BoundLiteralPredicate is subclass of BoundPredicate, list[BoundLiteralPredicate] is not that of list[BoundPredicate])
+    expected = re.escape(
+        """Mismatch in fields:
 ┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃    ┃ Table field              ┃ Dataframe field         ┃ Overwrite filter field ┃
 ┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━┩
@@ -1327,27 +1284,22 @@ def test__check_schema_with_filter_fail_on_type_mismatch():
 │ ❌ │ 2: bar: required int     │ 2: bar: required string │ N/A                    │
 │ ✅ │ 3: baz: optional boolean │ N/A                     │ baz                    │
 └────┴──────────────────────────┴─────────────────────────┴────────────────────────┘
-''')
-    with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema, other_schema, filter_predicates = filter_predicates)
-
-
-def test__check_schema_with_field_fail_due_to_filter_and_dataframe_hold_same_field():
-    table_schema: Schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
+"""
     )
+    with pytest.raises(ValueError, match=expected):
+        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+
+
+def test__check_schema_with_filter_fails_due_to_filter_and_dataframe_holding_same_field(iceberg_schema_simple: Schema) -> None:
     other_schema: pa.Schema = pa.schema([
         pa.field('foo', pa.string()),
         pa.field('bar', pa.int32(), nullable=False),
     ])
 
     unbound_preds = [IsNull(Reference("foo")), EqualTo(Reference("baz"), True)]
-    filter_predicates = [pred.bind(table_schema) for pred in unbound_preds]
-    expected = re.escape('''Mismatch in fields:
+    filter_predicates: Set[BoundPredicate[Any]] = {pred.bind(iceberg_schema_simple) for pred in unbound_preds}  # type: ignore  # bind returns BoundLiteralPredicate and BoundUnaryPredicate and thus set has type inferred as Set[BooleanExpression] which could not be downcast to Set[BoundPredicate[Any]] implicitly using :.
+    expected = re.escape(
+        """Mismatch in fields:
 ┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃    ┃ Table field              ┃ Dataframe field         ┃ Overwrite filter field ┃
 ┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━┩
@@ -1355,42 +1307,64 @@ def test__check_schema_with_field_fail_due_to_filter_and_dataframe_hold_same_fie
 │ ✅ │ 2: bar: required int     │ 2: bar: required int    │ N/A                    │
 │ ✅ │ 3: baz: optional boolean │ N/A                     │ baz                    │
 └────┴──────────────────────────┴─────────────────────────┴────────────────────────┘
-''')
+"""
+    )
     with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema, other_schema, filter_predicates = filter_predicates)
+        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
 @pytest.mark.parametrize(
-    "pred, raises, is_null_list, eq_to_list", 
+    "pred, raises, is_null_preds, eq_to_preds",
     [
         (EqualTo(Reference("foo"), "hello"), False, {}, {EqualTo(Reference("foo"), "hello")}),
         (IsNull(Reference("foo")), False, {IsNull(Reference("foo"))}, {}),
-        (And(IsNull(Reference("foo")),EqualTo(Reference("boo"), "hello")), False, {IsNull(Reference("foo"))}, {EqualTo(Reference("boo"), "hello")}),
+        (
+            And(IsNull(Reference("foo")), EqualTo(Reference("boo"), "hello")),
+            False,
+            {IsNull(Reference("foo"))},
+            {EqualTo(Reference("boo"), "hello")},
+        ),
         (NotNull, True, {}, {}),
         (NotEqualTo, True, {}, {}),
         (LessThan(Reference("foo"), 5), True, {}, {}),
-        (Or(IsNull(Reference("foo")),EqualTo(Reference("foo"), "hello")), True, {}, {}),
-        (And(EqualTo(Reference("foo"), "hello"), And(IsNull(Reference("baz")), EqualTo(Reference("boo"), "hello"))), False, {IsNull(Reference("baz"))}, {EqualTo(Reference("foo"), "hello"), EqualTo(Reference("boo"), "hello")}),
+        (Or(IsNull(Reference("foo")), EqualTo(Reference("foo"), "hello")), True, {}, {}),
+        (
+            And(EqualTo(Reference("foo"), "hello"), And(IsNull(Reference("baz")), EqualTo(Reference("boo"), "hello"))),
+            False,
+            {IsNull(Reference("baz"))},
+            {EqualTo(Reference("foo"), "hello"), EqualTo(Reference("boo"), "hello")},
+        ),
         # Below are crowd-crush tests: a same field can only be with same literal/null, not different literals or both literal and null
         # A false crush: when there are duplicated isnull/equalto, the collector should deduplicate them.
-        (And(EqualTo(Reference("foo"), "hello"), EqualTo(Reference("foo"), "hello")), False, {}, {EqualTo(Reference("foo"), "hello")}),
+        (
+            And(EqualTo(Reference("foo"), "hello"), EqualTo(Reference("foo"), "hello")),
+            False,
+            {},
+            {EqualTo(Reference("foo"), "hello")},
+        ),
         # When crush happens
-        (And(EqualTo(Reference("foo"), "hello"), EqualTo(Reference("foo"), "bye")), True, {}, {EqualTo(Reference("foo"), "hello"), EqualTo(Reference("foo"), "bye")}),
-        (And(EqualTo(Reference("foo"), "hello"), IsNull(Reference("foo"))), True, {IsNull(Reference("foo"))}, {})
+        (
+            And(EqualTo(Reference("foo"), "hello"), EqualTo(Reference("foo"), "bye")),
+            True,
+            {},
+            {EqualTo(Reference("foo"), "hello"), EqualTo(Reference("foo"), "bye")},
+        ),
+        (And(EqualTo(Reference("foo"), "hello"), IsNull(Reference("foo"))), True, {IsNull(Reference("foo"))}, {}),
     ],
 )
-def test__validate_static_overwrite_filter_expr_type(pred, raises, is_null_list, eq_to_list)-> None:
+def test__validate_static_overwrite_filter_expr_type(
+    pred: Union[IsNull, EqualTo[Any]], raises: bool, is_null_preds: Set[IsNull], eq_to_preds: Set[EqualTo[L]]
+) -> None:
     if raises:
-        with pytest.raises(ValueError): # match=expected): to do
+        with pytest.raises(ValueError):
             res = _validate_static_overwrite_filter_expr_type(pred)
     else:
         res = _validate_static_overwrite_filter_expr_type(pred)
-        assert set([str(e) for e in res[0]]) == set([str(e) for e in is_null_list])
-        assert set([str(e) for e in res[1]]) == set([str(e) for e in eq_to_list])
+        assert {str(e) for e in res[0]} == {str(e) for e in is_null_preds}
+        assert {str(e) for e in res[1]} == {str(e) for e in eq_to_preds}
 
 
-
-def test_schema_mismatch_type(table_schema_simple: Schema) -> None:
+def test_check_schema_mismatch_type(table_schema_simple: Schema) -> None:
     other_schema = pa.schema((
         pa.field("foo", pa.string(), nullable=True),
         pa.field("bar", pa.decimal128(18, 6), nullable=False),
@@ -1411,7 +1385,7 @@ def test_schema_mismatch_type(table_schema_simple: Schema) -> None:
         _check_schema(table_schema_simple, other_schema)
 
 
-def test_schema_mismatch_nullability(table_schema_simple: Schema) -> None:
+def test_check_schema_mismatch_nullability(table_schema_simple: Schema) -> None:
     other_schema = pa.schema((
         pa.field("foo", pa.string(), nullable=True),
         pa.field("bar", pa.int32(), nullable=True),
@@ -1432,7 +1406,7 @@ def test_schema_mismatch_nullability(table_schema_simple: Schema) -> None:
         _check_schema(table_schema_simple, other_schema)
 
 
-def test_schema_mismatch_missing_field(table_schema_simple: Schema) -> None:
+def test_check_schema_mismatch_missing_field(table_schema_simple: Schema) -> None:
     other_schema = pa.schema((
         pa.field("foo", pa.string(), nullable=True),
         pa.field("baz", pa.bool_(), nullable=True),
@@ -1451,7 +1425,8 @@ def test_schema_mismatch_missing_field(table_schema_simple: Schema) -> None:
     with pytest.raises(ValueError, match=expected):
         _check_schema(table_schema_simple, other_schema)
 
-def test_schema_succeed(table_schema_simple: Schema) -> None:
+
+def test_check_schema_succeed(table_schema_simple: Schema) -> None:
     other_schema = pa.schema((
         pa.field("foo", pa.string(), nullable=True),
         pa.field("bar", pa.int32(), nullable=False),
@@ -1460,7 +1435,8 @@ def test_schema_succeed(table_schema_simple: Schema) -> None:
 
     _check_schema(table_schema_simple, other_schema)
 
-def test_schema_succeed_on_pyarrow_table_reversed_order(table_schema_simple: Schema) -> None:
+
+def test_schema_succeed_on_pyarrow_table_reversed_column_order(table_schema_simple: Schema) -> None:
     other_schema = pa.schema((
         pa.field("baz", pa.bool_(), nullable=True),
         pa.field("bar", pa.int32(), nullable=False),

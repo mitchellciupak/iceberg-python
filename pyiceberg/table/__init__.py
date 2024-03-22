@@ -51,10 +51,15 @@ from typing_extensions import Annotated
 
 from pyiceberg.exceptions import CommitFailedException, ResolveError, ValidationError
 from pyiceberg.expressions import (
+    AlwaysFalse,
     AlwaysTrue,
     And,
     BooleanExpression,
+    BoundEqualTo,
+    BoundIsNull,
+    BoundPredicate,
     EqualTo,
+    IsNull,
     Reference,
     parser,
     visitors,
@@ -115,14 +120,7 @@ from pyiceberg.table.snapshots import (
 )
 from pyiceberg.table.sorting import SortOrder
 from pyiceberg.transforms import TimeTransform, Transform, VoidTransform
-from pyiceberg.typedef import (
-    EMPTY_DICT,
-    IcebergBaseModel,
-    IcebergRootModel,
-    Identifier,
-    KeyDefaultDict,
-    Properties,
-)
+from pyiceberg.typedef import EMPTY_DICT, IcebergBaseModel, IcebergRootModel, Identifier, KeyDefaultDict, L, Properties
 from pyiceberg.types import (
     IcebergType,
     ListType,
@@ -133,42 +131,6 @@ from pyiceberg.types import (
 )
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.datetime import datetime_to_millis
-
-from pyiceberg.expressions import (
-    AlwaysFalse,
-    AlwaysTrue,
-    And,
-    BooleanExpression,
-    BoundEqualTo,
-    BoundGreaterThan,
-    BoundGreaterThanOrEqual,
-    BoundIn,
-    BoundIsNaN,
-    BoundIsNull,
-    BoundLessThan,
-    BoundLessThanOrEqual,
-    BoundNotEqualTo,
-    BoundNotIn,
-    BoundNotNaN,
-    BoundNotNull,
-    BoundReference,
-    EqualTo,
-    GreaterThan,
-    GreaterThanOrEqual,
-    In,
-    IsNaN,
-    IsNull,
-    LessThan,
-    LessThanOrEqual,
-    Not,
-    NotEqualTo,
-    NotIn,
-    NotNaN,
-    NotNull,
-    Or,
-    Reference,
-    UnboundPredicate,
-)
 
 if TYPE_CHECKING:
     import daft
@@ -185,82 +147,106 @@ TABLE_ROOT_ID = -1
 
 _JAVA_LONG_MAX = 9223372036854775807
 
+
 # to do: make the types not expression but unbound predicates, this should be more precise, we already know it could only be unboundisnull and unboundequalto
 # actually could make it union[isnull, equalto] and make the return as union[boundisnull,boundequalto]
-def _validate_static_overwrite_filter_field(unbound_expr: BooleanExpression, table_schema: Schema, spec:PartitionSpec)-> BoundPredicate:
+def _bind_and_validate_static_overwrite_filter_predicate(
+    unbound_expr: Union[IsNull, EqualTo[L]], table_schema: Schema, spec: PartitionSpec
+) -> Union[BoundIsNull[L], BoundEqualTo[L]]:
     # step 1: check the unbound_expr is within the schema and the value matches the schema
-    print(f"unbound_expr is {unbound_expr=}")
-    bound_expr = unbound_expr.bind(table_schema)
+    bound_expr: Union[BoundIsNull[L], BoundEqualTo[L], AlwaysFalse] = unbound_expr.bind(table_schema)  # type: ignore  # The bind returns upcast types.
 
-    # step 2: check non nullable column is not partitioned overwriten with isNull. 
-    # It has to break cuz we cannot add null value for that column if it is non-nullable.
+    # step 2: check non nullable column is not partitioned overwriten with isNull.
+    # It has to break because we cannot fill null values into input arrow table (and parquets to write) for an iceberg field which is non-nullable.
     if isinstance(bound_expr, AlwaysFalse):
-        raise ValueError(f"Static overwriting with part of the explicit partition filter not meaningful (e.g. specifing a non-nullable partition field to be null).")
+        raise ValueError(
+            "Static overwriting with part of the explicit partition filter not meaningful (specifing a non-nullable partition field to be null)."
+        )
 
     # step 3: check the unbound_expr is within the partition spec
-    # this is the part unbound_expr
-    nested_field = bound_expr.term.ref().field
-    part_fields = spec.fields_by_source_id(nested_field.field_id)  
-    print(f"{part_fields=}")
+    if not isinstance(bound_expr, (BoundIsNull, BoundEqualTo)):
+        raise ValueError(
+            f"{unbound_expr=} binds to {bound_expr=} whose type is not expected. Expecting BoundIsNull or BoundEqualTo"
+        )
+    nested_field: NestedField = bound_expr.term.ref().field
+    part_fields: List[PartitionField] = spec.fields_by_source_id(nested_field.field_id)
     if len(part_fields) != 1:
-        raise ValueError(f"get {len(part_fields)=}, not 1, if this number is 0, indicating the static filter is not within the partition fields, which is invalid")
+        raise ValueError(f"Get {len(part_fields)} partition fields from filter predicate {str(unbound_expr)}, expecting 1.")
     part_field = part_fields[0]
 
-
     # step 4: check the unbound_expr is with identity transform
-    print(f"{part_field.transform=}")
     if not isinstance(part_field.transform, IdentityTransform):
-        raise ValueError(f"static overwrite partition filter can only apply to partition fields which are without hidden transform, but get {part_field.transform=} for {nested_field=}")
+        raise ValueError(
+            f"static overwrite partition filter can only apply to partition fields which are without hidden transform, but get {part_field.transform=} for {nested_field=}"
+        )
 
-    return bound_expr #   nested_field
-    
+    return bound_expr
 
-def _validate_static_overwrite_filter(table_schema: Schema, overwrite_filter: BooleanExpression, spec:PartitionSpec) -> None:
+
+def _validate_static_overwrite_filter(
+    table_schema: Schema, overwrite_filter: BooleanExpression, spec: PartitionSpec
+) -> Tuple[Set[BoundIsNull[L]], Set[BoundEqualTo[L]]]:
     is_null_predicates, eq_to_predicates = _validate_static_overwrite_filter_expr_type(expr=overwrite_filter)
 
-    bound_is_null_predicates = []
-    bound_eq_to_predicates = []
+    bound_is_null_preds = set()
+    bound_eq_to_preds = set()
+    for unbound_is_null in is_null_predicates:
+        bound_pred = _bind_and_validate_static_overwrite_filter_predicate(
+            unbound_expr=unbound_is_null, table_schema=table_schema, spec=spec
+        )
+        if not isinstance(bound_pred, BoundIsNull):
+            raise ValueError(f"Expecting IsNull after binding {unbound_is_null} to schema but get {bound_pred}.")
+        bound_is_null_preds.add(bound_pred)
 
-    print("---check is null fields with rules of filter,part,transform")
-    # these are expressions (not as name - fields)
-    for unbound_expr in is_null_predicates:
-        bp:BoundPredicate = _validate_static_overwrite_filter_field(unbound_expr = unbound_expr, table_schema = table_schema, spec = spec)
-        #bound_field.term.ref().field
-        bound_is_null_predicates.append(bp)
+    for unbound_eq_to in eq_to_predicates:
+        bound_pred = _bind_and_validate_static_overwrite_filter_predicate(
+            unbound_expr=unbound_eq_to, table_schema=table_schema, spec=spec
+        )
+        if not isinstance(bound_pred, BoundEqualTo):
+            raise ValueError(f"Expecting IsNull after binding {unbound_eq_to} to schema but get {bound_pred}.")
+        bound_eq_to_preds.add(bound_pred)
+    return (bound_is_null_preds, bound_eq_to_preds)  # type: ignore
 
-    print("----check eq to fields with rules of filter,part,transform")
-    for unbound_expr in eq_to_predicates:
-        bp:BoundPredicate = _validate_static_overwrite_filter_field(unbound_expr = unbound_expr, table_schema = table_schema, spec = spec)
-        bound_eq_to_predicates.append(bp)
 
-    return bound_is_null_predicates, bound_eq_to_predicates
- 
-import pyarrow as pa
-def _fill_in_df(df: pa.Table, bound_is_null_predicates: List[BoundIsNull], bound_eq_to_predicates: List[BoundEqualTo]):
-    """Use bound filter predicates to extend the pyarrow with correct schema matching the iceberg schema and fill in the values. 
-    """
+def _fill_in_df(
+    df: pa.Table, bound_is_null_predicates: Set[BoundIsNull[L]], bound_eq_to_predicates: Set[BoundEqualTo[L]]
+) -> pa.Table:
+    """Use bound filter predicates to extend the pyarrow with correct schema matching the iceberg schema and fill in the values."""
+    try:
+        import pyarrow as pa
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
+
     is_null_nested_fields = [bound_predicate.term.ref().field for bound_predicate in bound_is_null_predicates]
     eq_to_nested_fields = [bound_predicate.term.ref().field for bound_predicate in bound_eq_to_predicates]
-    from itertools import chain
+
     schema = Schema(*chain(is_null_nested_fields, eq_to_nested_fields))
-    print(f"{schema=}")
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
     pa_schema = schema_to_pyarrow(schema)
-    print(f"{pa_schema=}")
 
-    is_null_nested_field_name_values = zip([nested_field.name for nested_field in is_null_nested_fields], [None]*len(bound_is_null_predicates))
-    eq_to_nested_field_name_values = zip([nested_field.name for nested_field in eq_to_nested_fields], [predicate.literal.value for predicate in bound_eq_to_predicates]) 
-    
-    num_rows = df.num_rows
-    for field_name, value in chain(is_null_nested_field_name_values,eq_to_nested_field_name_values):
-        print(f"{field_name=}, {value=}")
+    is_null_nested_field_name_values = zip(
+        [nested_field.name for nested_field in is_null_nested_fields], [None] * len(bound_is_null_predicates)
+    )
+    eq_to_nested_field_name_values = zip(
+        [nested_field.name for nested_field in eq_to_nested_fields],
+        [predicate.literal.value for predicate in bound_eq_to_predicates],
+    )
+
+    for field_name, value in chain(is_null_nested_field_name_values, eq_to_nested_field_name_values):
         pa_field = pa_schema.field(field_name)
-        literal_array = pa.array([value] * num_rows, type=pa_field.type)
+        literal_array = pa.array([value] * df.num_rows, type=pa_field.type)
         df = df.add_column(df.num_columns, field_name, literal_array)
     return df
 
-def _check_schema(table_schema: Schema, other_schema: "pa.Schema", filter_predicates: List[BoundPredicate]=[]):
+
+# linttodo: break this down into 2 functions
+def _check_schema(
+    table_schema: Schema, other_schema: "pa.Schema", filter_predicates: Set[BoundPredicate[L]] | None = None
+) -> None:
+    if filter_predicates is None:
+        filter_predicates = set()
+
     from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
 
     name_mapping = table_schema.name_mapping
@@ -273,9 +259,9 @@ def _check_schema(table_schema: Schema, other_schema: "pa.Schema", filter_predic
             f"PyArrow table contains more columns: {', '.join(sorted(additional_names))}. Update the schema first (hint, use union_by_name)."
         ) from e
 
-    def compare_and_rich_print(table_schema: Schema, task_schema: Schema):
-        sorted_table_schema = Schema(*sorted(table_schema.fields, key=lambda field:field.field_id))
-        sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field:field.field_id))
+    def compare_and_rich_print(table_schema: Schema, task_schema: Schema) -> None:
+        sorted_table_schema = Schema(*sorted(table_schema.fields, key=lambda field: field.field_id))
+        sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
         if sorted_table_schema.as_struct() != sorted_task_schema.as_struct():
             from rich.console import Console
             from rich.table import Table as RichTable
@@ -297,11 +283,13 @@ def _check_schema(table_schema: Schema, other_schema: "pa.Schema", filter_predic
             console.print(rich_table)
             raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
 
-    def compare_and_rich_print_with_filter(table_schema: Schema, task_schema: Schema, filter_predicates: List[BoundPredicate]):
+    def compare_and_rich_print_with_filter(
+        table_schema: Schema, task_schema: Schema, filter_predicates: Set[BoundPredicate[L]]
+    ) -> None:
         filter_fields = [bound_predicate.term.ref().field for bound_predicate in filter_predicates]
-        remaining_schema = _truncate_fields(table_schema, to_truncate = filter_fields)
-        sorted_remaining_schema = Schema(*sorted(remaining_schema.fields, key=lambda field:field.field_id))
-        sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field:field.field_id))
+        remaining_schema = _truncate_fields(table_schema, to_truncate=filter_fields)
+        sorted_remaining_schema = Schema(*sorted(remaining_schema.fields, key=lambda field: field.field_id))
+        sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
         if sorted_remaining_schema.as_struct() != sorted_task_schema.as_struct():
             from rich.console import Console
             from rich.table import Table as RichTable
@@ -336,81 +324,51 @@ def _check_schema(table_schema: Schema, other_schema: "pa.Schema", filter_predic
         compare_and_rich_print_with_filter(table_schema, task_schema, filter_predicates)
     else:
         compare_and_rich_print(table_schema, task_schema)
-    
+
 
 def _truncate_fields(table_schema: Schema, to_truncate: List[NestedField]) -> Schema:
-    to_truncate_fields_source_ids = set(nested_field.field_id for nested_field in to_truncate)
+    to_truncate_fields_source_ids = {nested_field.field_id for nested_field in to_truncate}
     truncated = [field for field in table_schema.fields if field.field_id not in to_truncate_fields_source_ids]
     return Schema(*truncated)
 
 
-def _validate_static_overwrite_filter_expr_type(expr: BooleanExpression):
-    '''Validate whether expression only has 1)And 2)IsNull and 3)EqualTo and break down the raw expression into IsNull and EqualTo.
-    '''
-    from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
+def _validate_static_overwrite_filter_expr_type(expr: BooleanExpression) -> Tuple[Set[IsNull], Set[EqualTo[L]]]:
+    """Validate whether expression only has 1)And 2)IsNull and 3)EqualTo and break down the raw expression into IsNull and EqualTo."""
     from collections import defaultdict
 
-    def _recursively_fetch_fields(expr, is_null_predicates, eq_to_predicates) -> None:
-        print(f"get expression as {expr=}")
+    def _recursively_fetch_fields(
+        expr: BooleanExpression, is_null_predicates: Set[IsNull], eq_to_predicates: Set[EqualTo[L]]
+    ) -> None:
         if isinstance(expr, EqualTo):
+            if not isinstance(expr.term, Reference):
+                raise ValueError(f"Unsupported unbound term {expr.term} in {expr}, expecting a refernce.")
             duplication_check[expr.term.name].add(expr)
             eq_to_predicates.add(expr)
         elif isinstance(expr, IsNull):
+            if not isinstance(expr.term, Reference):
+                raise ValueError(f"Unsupported unbound term {expr.term} in {expr}, expecting a refernce.")
             duplication_check[expr.term.name].add(expr)
             is_null_predicates.add(expr)
         elif isinstance(expr, And):
             _recursively_fetch_fields(expr.left, is_null_predicates, eq_to_predicates)
             _recursively_fetch_fields(expr.right, is_null_predicates, eq_to_predicates)
         else:
-            raise ValueError(f"static overwrite partitioning filter can only be isequalto, is null, and, alwaysTrue, but get {expr=}")
+            raise ValueError(
+                f"static overwrite partitioning filter can only be isequalto, is null, and, alwaysTrue, but get {expr=}"
+            )
 
-    duplication_check = defaultdict(set)
-    is_null_predicates = set()
-    eq_to_predicates = set()
+    duplication_check: Dict[str, Set[Union[IsNull, EqualTo[L]]]] = defaultdict(set)
+    is_null_predicates: Set[IsNull] = set()
+    eq_to_predicates: Set[EqualTo[L]] = set()
     _recursively_fetch_fields(expr, is_null_predicates, eq_to_predicates)
-    for field, expr_set in duplication_check.items():
+    for _, expr_set in duplication_check.items():
         if len(expr_set) != 1:
-            raise ValueError(f"static overwrite partitioning filter has more than 1 different predicates with same field {expr_set}")
-    print(f"{is_null_predicates=}")
-    print(f"{eq_to_predicates=}")
+            raise ValueError(
+                f"static overwrite partitioning filter has more than 1 different predicates with same field {expr_set}"
+            )
 
     # check fields don't step into itself, and do not step into each other, maybe we could move this to other 1+3(here) fields check
     return is_null_predicates, eq_to_predicates
-    
-
-# def _check_schema(table_schema: Schema, other_schema: "pa.Schema") -> None:
-#     from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
-
-#     name_mapping = table_schema.name_mapping
-#     try:
-#         task_schema = pyarrow_to_schema(other_schema, name_mapping=name_mapping)
-#     except ValueError as e:
-#         other_schema = _pyarrow_to_schema_without_ids(other_schema)
-#         additional_names = set(other_schema.column_names) - set(table_schema.column_names)
-#         raise ValueError(
-#             f"PyArrow table contains more columns: {', '.join(sorted(additional_names))}. Update the schema first (hint, use union_by_name)."
-#         ) from e
-
-#     if table_schema.as_struct() != task_schema.as_struct():
-#         from rich.console import Console
-#         from rich.table import Table as RichTable
-
-#         console = Console(record=True)
-
-#         rich_table = RichTable(show_header=True, header_style="bold")
-#         rich_table.add_column("")
-#         rich_table.add_column("Table field")
-#         rich_table.add_column("Dataframe field")
-
-#         for lhs in table_schema.fields:
-#             try:
-#                 rhs = task_schema.find_field(lhs.field_id)
-#                 rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs))
-#             except ValueError:
-#                 rich_table.add_row("❌", str(lhs), "Missing")
-
-#         console.print(rich_table)
-#         raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
 
 
 class TableProperties:
@@ -1388,21 +1346,19 @@ class Table:
             raise ValueError(f"Expected PyArrow table, got: {df}")
         overwrite_filter = _parse_row_filter(overwrite_filter)
         if not overwrite_filter == ALWAYS_TRUE:
-            bound_is_null_predicates, bound_eq_to_predicates = _validate_static_overwrite_filter(table_schema=self.schema(), overwrite_filter=overwrite_filter, spec=self.metadata.spec())
-            print("----check fields in partition filter and in the dataframe are mutual exclusive but unioning to full schema")
-        
-            is_null_nested_fields = [bound_predicate.term.ref().field for bound_predicate in bound_is_null_predicates]
-            eq_to_nested_fields = [bound_predicate.term.ref().field for bound_predicate in bound_eq_to_predicates]
-            print(f"{is_null_nested_fields=}")
-            print(f"{eq_to_nested_fields=}")
-            #_check_schema(table_schema, other_schema, to_truncate = is_null_nested_fields + eq_to_nested_fields)
-            # bound_is_null_predicates
-            _check_schema(table_schema=self.schema(), other_schema=df.schema, filter_predicates = bound_is_null_predicates + bound_eq_to_predicates)
+            bound_is_null_predicates, bound_eq_to_predicates = _validate_static_overwrite_filter(
+                table_schema=self.schema(), overwrite_filter=overwrite_filter, spec=self.metadata.spec()
+            )
+
+            _check_schema(
+                table_schema=self.schema(),
+                other_schema=df.schema,
+                filter_predicates=bound_is_null_predicates.union(bound_eq_to_predicates),
+            )
             df = _fill_in_df(df, bound_is_null_predicates, bound_eq_to_predicates)
         else:
             _check_schema(table_schema=self.schema(), other_schema=df.schema)
 
-    
         with self.transaction() as txn:
             with txn.update_snapshot().overwrite(overwrite_filter) as update_snapshot:
                 # skip writing data files if the dataframe is empty
@@ -2928,9 +2884,7 @@ def _get_partition_sort_order(partition_columns: list[str], reverse: bool = Fals
 
 
 def get_partition_columns(iceberg_table_metadata: TableMetadata, arrow_table: pa.Table) -> list[str]:
-    print(f"{arrow_table=}")
     arrow_table_cols = set(arrow_table.column_names)
-    print(f"{arrow_table_cols=}")
     partition_cols = []
     for transform_field in iceberg_table_metadata.spec().fields:
         column_name = iceberg_table_metadata.schema().find_column_name(transform_field.source_id)
@@ -3001,7 +2955,6 @@ def partition(iceberg_table_metadata: TableMetadata, arrow_table: pa.Table) -> I
     partition_columns = get_partition_columns(iceberg_table_metadata, arrow_table)
 
     sort_order_options = _get_partition_sort_order(partition_columns, reverse=False)
-    print(f"{sort_order_options=}")
     sorted_arrow_table_indices = pc.sort_indices(arrow_table, **sort_order_options)
 
     # group table by partition scheme
