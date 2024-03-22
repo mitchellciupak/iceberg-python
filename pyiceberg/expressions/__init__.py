@@ -373,10 +373,7 @@ class UnboundPredicate(Generic[L], Unbound[BooleanExpression], BooleanExpression
 class UnaryPredicate(UnboundPredicate[Any], ABC):
     def bind(self, schema: Schema, case_sensitive: bool = True) -> BoundUnaryPredicate[Any]:
         bound_term = self.term.bind(schema, case_sensitive)
-        print(f"{bound_term=}")
-        res = self.as_bound(bound_term)
-        print(f"{res=}")
-        return res
+        return self.as_bound(bound_term)
 
     def __repr__(self) -> str:
         """Return the string representation of the UnaryPredicate class."""
