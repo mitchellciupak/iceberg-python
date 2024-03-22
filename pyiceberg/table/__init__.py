@@ -148,8 +148,6 @@ TABLE_ROOT_ID = -1
 _JAVA_LONG_MAX = 9223372036854775807
 
 
-# to do: make the types not expression but unbound predicates, this should be more precise, we already know it could only be unboundisnull and unboundequalto
-# actually could make it union[isnull, equalto] and make the return as union[boundisnull,boundequalto]
 def _bind_and_validate_static_overwrite_filter_predicate(
     unbound_expr: Union[IsNull, EqualTo[L]], table_schema: Schema, spec: PartitionSpec
 ) -> Union[BoundIsNull[L], BoundEqualTo[L]]:
@@ -240,13 +238,7 @@ def _fill_in_df(
     return df
 
 
-# linttodo: break this down into 2 functions
-def _check_schema(
-    table_schema: Schema, other_schema: "pa.Schema", filter_predicates: Set[BoundPredicate[L]] | None = None
-) -> None:
-    if filter_predicates is None:
-        filter_predicates = set()
-
+def _arrow_schema_to_iceberg_schema_with_field_ids(table_schema: Schema, other_schema: "pa.Schema") -> Schema:
     from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
 
     name_mapping = table_schema.name_mapping
@@ -258,72 +250,157 @@ def _check_schema(
         raise ValueError(
             f"PyArrow table contains more columns: {', '.join(sorted(additional_names))}. Update the schema first (hint, use union_by_name)."
         ) from e
+    return task_schema
 
-    def compare_and_rich_print(table_schema: Schema, task_schema: Schema) -> None:
-        sorted_table_schema = Schema(*sorted(table_schema.fields, key=lambda field: field.field_id))
-        sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
-        if sorted_table_schema.as_struct() != sorted_task_schema.as_struct():
-            from rich.console import Console
-            from rich.table import Table as RichTable
 
-            console = Console(record=True)
+def _check_schema_with_filter_predicates(
+    table_schema: Schema, other_schema: "pa.Schema", filter_predicates: Set[BoundPredicate[L]]
+) -> None:
+    task_schema = _arrow_schema_to_iceberg_schema_with_field_ids(table_schema, other_schema)
 
-            rich_table = RichTable(show_header=True, header_style="bold")
-            rich_table.add_column("")
-            rich_table.add_column("Table field")
-            rich_table.add_column("Dataframe field")
+    filter_fields = [bound_predicate.term.ref().field for bound_predicate in filter_predicates]
+    remaining_schema = _truncate_fields(table_schema, to_truncate=filter_fields)
+    sorted_remaining_schema = Schema(*sorted(remaining_schema.fields, key=lambda field: field.field_id))
+    sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
+    if sorted_remaining_schema.as_struct() != sorted_task_schema.as_struct():
+        from rich.console import Console
+        from rich.table import Table as RichTable
 
-            for lhs in table_schema.fields:
+        console = Console(record=True)
+
+        rich_table = RichTable(show_header=True, header_style="bold")
+        rich_table.add_column("")
+        rich_table.add_column("Table field")
+        rich_table.add_column("Dataframe field")
+        rich_table.add_column("Overwrite filter field")
+
+        filter_field_names = [field.name for field in filter_fields]
+        for lhs in table_schema.fields:
+            if lhs.name in filter_field_names:
                 try:
                     rhs = task_schema.find_field(lhs.field_id)
-                    rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs))
+                    rich_table.add_row("❌", str(lhs), str(rhs), lhs.name)
                 except ValueError:
-                    rich_table.add_row("❌", str(lhs), "Missing")
+                    rich_table.add_row("✅", str(lhs), "N/A", lhs.name)
+            else:
+                try:
+                    rhs = task_schema.find_field(lhs.field_id)
+                    rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs), "N/A")
+                except ValueError:
+                    rich_table.add_row("❌", str(lhs), "Missing", "N/A")
 
-            console.print(rich_table)
-            raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
+        console.print(rich_table)
+        raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
 
-    def compare_and_rich_print_with_filter(
-        table_schema: Schema, task_schema: Schema, filter_predicates: Set[BoundPredicate[L]]
-    ) -> None:
-        filter_fields = [bound_predicate.term.ref().field for bound_predicate in filter_predicates]
-        remaining_schema = _truncate_fields(table_schema, to_truncate=filter_fields)
-        sorted_remaining_schema = Schema(*sorted(remaining_schema.fields, key=lambda field: field.field_id))
-        sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
-        if sorted_remaining_schema.as_struct() != sorted_task_schema.as_struct():
-            from rich.console import Console
-            from rich.table import Table as RichTable
 
-            console = Console(record=True)
+def _check_schema(table_schema: Schema, other_schema: "pa.Schema") -> None:
+    task_schema = _arrow_schema_to_iceberg_schema_with_field_ids(table_schema, other_schema)
 
-            rich_table = RichTable(show_header=True, header_style="bold")
-            rich_table.add_column("")
-            rich_table.add_column("Table field")
-            rich_table.add_column("Dataframe field")
-            rich_table.add_column("Overwrite filter field")
+    if table_schema.as_struct() != task_schema.as_struct():
+        from rich.console import Console
+        from rich.table import Table as RichTable
 
-            filter_field_names = [field.name for field in filter_fields]
-            for lhs in table_schema.fields:
-                if lhs.name in filter_field_names:
-                    try:
-                        rhs = task_schema.find_field(lhs.field_id)
-                        rich_table.add_row("❌", str(lhs), str(rhs), lhs.name)
-                    except ValueError:
-                        rich_table.add_row("✅", str(lhs), "N/A", lhs.name)
-                else:
-                    try:
-                        rhs = task_schema.find_field(lhs.field_id)
-                        rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs), "N/A")
-                    except ValueError:
-                        rich_table.add_row("❌", str(lhs), "Missing", "N/A")
+        console = Console(record=True)
 
-            console.print(rich_table)
-            raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
+        rich_table = RichTable(show_header=True, header_style="bold")
+        rich_table.add_column("")
+        rich_table.add_column("Table field")
+        rich_table.add_column("Dataframe field")
 
-    if len(filter_predicates) != 0:
-        compare_and_rich_print_with_filter(table_schema, task_schema, filter_predicates)
-    else:
-        compare_and_rich_print(table_schema, task_schema)
+        for lhs in table_schema.fields:
+            try:
+                rhs = task_schema.find_field(lhs.field_id)
+                rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs))
+            except ValueError:
+                rich_table.add_row("❌", str(lhs), "Missing")
+
+        console.print(rich_table)
+        raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
+
+
+# def _check_schema(
+#     table_schema: Schema, other_schema: "pa.Schema", filter_predicates: Set[BoundPredicate[L]] | None = None
+# ) -> None:
+#     if filter_predicates is None:
+#         filter_predicates = set()
+
+#     from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
+
+#     name_mapping = table_schema.name_mapping
+#     try:
+#         task_schema = pyarrow_to_schema(other_schema, name_mapping=name_mapping)
+#     except ValueError as e:
+#         other_schema = _pyarrow_to_schema_without_ids(other_schema)
+#         additional_names = set(other_schema.column_names) - set(table_schema.column_names)
+#         raise ValueError(
+#             f"PyArrow table contains more columns: {', '.join(sorted(additional_names))}. Update the schema first (hint, use union_by_name)."
+#         ) from e
+
+#     def compare_and_rich_print(table_schema: Schema, task_schema: Schema) -> None:
+#         sorted_table_schema = Schema(*sorted(table_schema.fields, key=lambda field: field.field_id))
+#         sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
+#         if sorted_table_schema.as_struct() != sorted_task_schema.as_struct():
+#             from rich.console import Console
+#             from rich.table import Table as RichTable
+
+#             console = Console(record=True)
+
+#             rich_table = RichTable(show_header=True, header_style="bold")
+#             rich_table.add_column("")
+#             rich_table.add_column("Table field")
+#             rich_table.add_column("Dataframe field")
+
+#             for lhs in table_schema.fields:
+#                 try:
+#                     rhs = task_schema.find_field(lhs.field_id)
+#                     rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs))
+#                 except ValueError:
+#                     rich_table.add_row("❌", str(lhs), "Missing")
+
+#             console.print(rich_table)
+#             raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
+
+#     def compare_and_rich_print_with_filter(
+#         table_schema: Schema, task_schema: Schema, filter_predicates: Set[BoundPredicate[L]]
+#     ) -> None:
+#         filter_fields = [bound_predicate.term.ref().field for bound_predicate in filter_predicates]
+#         remaining_schema = _truncate_fields(table_schema, to_truncate=filter_fields)
+#         sorted_remaining_schema = Schema(*sorted(remaining_schema.fields, key=lambda field: field.field_id))
+#         sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
+#         if sorted_remaining_schema.as_struct() != sorted_task_schema.as_struct():
+#             from rich.console import Console
+#             from rich.table import Table as RichTable
+
+#             console = Console(record=True)
+
+#             rich_table = RichTable(show_header=True, header_style="bold")
+#             rich_table.add_column("")
+#             rich_table.add_column("Table field")
+#             rich_table.add_column("Dataframe field")
+#             rich_table.add_column("Overwrite filter field")
+
+#             filter_field_names = [field.name for field in filter_fields]
+#             for lhs in table_schema.fields:
+#                 if lhs.name in filter_field_names:
+#                     try:
+#                         rhs = task_schema.find_field(lhs.field_id)
+#                         rich_table.add_row("❌", str(lhs), str(rhs), lhs.name)
+#                     except ValueError:
+#                         rich_table.add_row("✅", str(lhs), "N/A", lhs.name)
+#                 else:
+#                     try:
+#                         rhs = task_schema.find_field(lhs.field_id)
+#                         rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs), "N/A")
+#                     except ValueError:
+#                         rich_table.add_row("❌", str(lhs), "Missing", "N/A")
+
+#             console.print(rich_table)
+#             raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
+
+#     if len(filter_predicates) != 0:
+#         compare_and_rich_print_with_filter(table_schema, task_schema, filter_predicates)
+#     else:
+#         compare_and_rich_print(table_schema, task_schema)
 
 
 def _truncate_fields(table_schema: Schema, to_truncate: List[NestedField]) -> Schema:
@@ -424,11 +501,11 @@ class PartitionProjector:
     def __init__(
         self,
         table_metadata: TableMetadata,
-        row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
+        row_filter: BooleanExpression = ALWAYS_TRUE,
         case_sensitive: bool = True,
     ):
         self.table_metadata = table_metadata
-        self.row_filter = _parse_row_filter(row_filter)
+        self.row_filter = _parse_row_filter(row_filter)  # todo make it BooleanExpression
         self.case_sensitive = case_sensitive
 
     def _build_partition_projection(self, spec_id: int) -> BooleanExpression:
@@ -1344,13 +1421,15 @@ class Table:
 
         if not isinstance(df, pa.Table):
             raise ValueError(f"Expected PyArrow table, got: {df}")
+
         overwrite_filter = _parse_row_filter(overwrite_filter)
+
         if not overwrite_filter == ALWAYS_TRUE:
             bound_is_null_predicates, bound_eq_to_predicates = _validate_static_overwrite_filter(
                 table_schema=self.schema(), overwrite_filter=overwrite_filter, spec=self.metadata.spec()
             )
 
-            _check_schema(
+            _check_schema_with_filter_predicates(
                 table_schema=self.schema(),
                 other_schema=df.schema,
                 filter_predicates=bound_is_null_predicates.union(bound_eq_to_predicates),
@@ -2678,17 +2757,16 @@ class _MergingSnapshotProducer(UpdateTableMetadata["_MergingSnapshotProducer"]):
     _io: FileIO
     _deleted_data_files: Optional[DeletedDataFiles]
 
-    # _manifests_compositions:  Any #list[Callable[[_MergingSnapshotProducer], List[ManifestFile]]]
     def __init__(
         self,
-        operation: Operation,  # done, inited
+        operation: Operation,
         transaction: Transaction,
-        io: FileIO,  # done, inited
-        overwrite_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
+        io: FileIO,
+        overwrite_filter: BooleanExpression = ALWAYS_TRUE,
         commit_uuid: Optional[uuid.UUID] = None,
     ) -> None:
         super().__init__(transaction)
-        self.commit_uuid = commit_uuid or uuid.uuid4()  # done
+        self.commit_uuid = commit_uuid or uuid.uuid4()
         self._io = io
         self._operation = operation
         self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
@@ -3089,7 +3167,7 @@ class OverwriteFiles(_MergingSnapshotProducer):
 
 
 class PartialOverwriteFiles(_MergingSnapshotProducer):
-    def __init__(self, overwrite_filter: Union[str, BooleanExpression], **kwargs: Any) -> None:
+    def __init__(self, overwrite_filter: BooleanExpression, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._deleted_data_files = ExplicitlyDeletedDataFiles()
         self.overwrite_filter = overwrite_filter
@@ -3173,9 +3251,7 @@ class UpdateSnapshot:
     def fast_append(self) -> FastAppendFiles:
         return FastAppendFiles(operation=Operation.APPEND, transaction=self._transaction, io=self._io)
 
-    def overwrite(
-        self, overwrite_filter: Union[str, BooleanExpression] = ALWAYS_TRUE
-    ) -> Union[OverwriteFiles, PartialOverwriteFiles]:
+    def overwrite(self, overwrite_filter: BooleanExpression = ALWAYS_TRUE) -> Union[OverwriteFiles, PartialOverwriteFiles]:
         if overwrite_filter == ALWAYS_TRUE:
             return OverwriteFiles(
                 operation=Operation.OVERWRITE

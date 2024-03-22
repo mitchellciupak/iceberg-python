@@ -74,6 +74,7 @@ from pyiceberg.table import (
     _apply_table_update,
     _bind_and_validate_static_overwrite_filter_predicate,
     _check_schema,
+    _check_schema_with_filter_predicates,
     _fill_in_df,
     _match_deletes_to_data_file,
     _TableMetadataUpdateContext,
@@ -1028,7 +1029,6 @@ def test_correct_schema() -> None:
     assert "Snapshot not found: -1" in str(exc_info.value)
 
 
-# _bind_and_validate_static_overwrite_filter_predicate
 def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_schema_fields_in_filter() -> None:
     test_schema = Schema(
         NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
@@ -1043,21 +1043,6 @@ def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_schem
     )
     with pytest.raises(ValueError, match="Could not find field with name not a field, case_sensitive=True"):
         _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
-
-
-# @pytest.mark.zy
-# def test_mine(table_schema_simple) -> None:
-#     pred = IsNull("bar")
-#     print("xxxx!", pred.term)
-#     pred.bind(table_schema_simple)
-
-
-#     from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
-#     pa_table = pa.table(
-#         {"bar": [1, 2, 3], "foo": ["a", "b", "c"],  "baz": [True, False, None]},
-#     )
-#     name_mapping = table_schema_simple.name_mapping
-#     print("xxxx!", pyarrow_to_schema(pa_table.schema, name_mapping=name_mapping))
 
 
 def test__fill_in_df(table_schema_simple: Schema) -> None:
@@ -1195,7 +1180,7 @@ def test__check_schema_with_filter_succeed(iceberg_schema_simple: Schema) -> Non
     # upcast set[BoundLiteralPredicate[int]] to set[BoundPredicate[int]]
     # because _check_schema expects set[BoundPredicate[int]] and set is not covariant
     # (meaning although BoundLiteralPredicate is subclass of BoundPredicate, list[BoundLiteralPredicate] is not that of list[BoundPredicate])
-    _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+    _check_schema_with_filter_predicates(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
 def test__check_schema_with_filter_succeed_on_pyarrow_table_with_random_column_order(iceberg_schema_simple: Schema) -> None:
@@ -1209,7 +1194,7 @@ def test__check_schema_with_filter_succeed_on_pyarrow_table_with_random_column_o
     # upcast set[BoundLiteralPredicate[int]] to set[BoundPredicate[int]]
     # because _check_schema expects set[BoundPredicate[int]] and set is not covariant
     # (meaning although BoundLiteralPredicate is subclass of BoundPredicate, list[BoundLiteralPredicate] is not that of list[BoundPredicate])
-    _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+    _check_schema_with_filter_predicates(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
 def test__check_schema_with_filter_fails_on_missing_field(iceberg_schema_simple: Schema) -> None:
@@ -1235,7 +1220,7 @@ def test__check_schema_with_filter_fails_on_missing_field(iceberg_schema_simple:
 """
     )
     with pytest.raises(ValueError, match=expected):
-        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+        _check_schema_with_filter_predicates(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
 def test__check_schema_with_filter_fails_on_nullability_mismatch(iceberg_schema_simple: Schema) -> None:
@@ -1261,7 +1246,7 @@ def test__check_schema_with_filter_fails_on_nullability_mismatch(iceberg_schema_
 """
     )
     with pytest.raises(ValueError, match=expected):
-        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+        _check_schema_with_filter_predicates(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
 def test__check_schema_with_filter_fails_on_type_mismatch(iceberg_schema_simple: Schema) -> None:
@@ -1287,7 +1272,7 @@ def test__check_schema_with_filter_fails_on_type_mismatch(iceberg_schema_simple:
 """
     )
     with pytest.raises(ValueError, match=expected):
-        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+        _check_schema_with_filter_predicates(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
 def test__check_schema_with_filter_fails_due_to_filter_and_dataframe_holding_same_field(iceberg_schema_simple: Schema) -> None:
@@ -1310,7 +1295,7 @@ def test__check_schema_with_filter_fails_due_to_filter_and_dataframe_holding_sam
 """
     )
     with pytest.raises(ValueError, match=expected):
-        _check_schema(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
+        _check_schema_with_filter_predicates(iceberg_schema_simple, other_schema, filter_predicates=filter_predicates)
 
 
 @pytest.mark.parametrize(
