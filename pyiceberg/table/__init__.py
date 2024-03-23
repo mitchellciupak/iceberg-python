@@ -296,7 +296,10 @@ def _check_schema_with_filter_predicates(
 def _check_schema(table_schema: Schema, other_schema: "pa.Schema") -> None:
     task_schema = _arrow_schema_to_iceberg_schema_with_field_ids(table_schema, other_schema)
 
-    if table_schema.as_struct() != task_schema.as_struct():
+    sorted_table_schema = Schema(*sorted(table_schema.fields, key=lambda field: field.field_id))
+    sorted_task_schema = Schema(*sorted(task_schema.fields, key=lambda field: field.field_id))
+
+    if sorted_table_schema.as_struct() != sorted_task_schema.as_struct():
         from rich.console import Console
         from rich.table import Table as RichTable
 

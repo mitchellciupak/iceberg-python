@@ -1029,20 +1029,17 @@ def test_correct_schema() -> None:
     assert "Snapshot not found: -1" in str(exc_info.value)
 
 
-def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_schema_fields_in_filter() -> None:
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_schema_fields_in_filter(
+    iceberg_schema_simple: Schema,
+) -> None:
     pred = EqualTo(Reference("not a field"), "hello")
     partition_spec = PartitionSpec(
         PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="test_part_col")
     )
     with pytest.raises(ValueError, match="Could not find field with name not a field, case_sensitive=True"):
-        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+        _bind_and_validate_static_overwrite_filter_predicate(
+            unbound_expr=pred, table_schema=iceberg_schema_simple, spec=partition_spec
+        )
 
 
 def test__fill_in_df(table_schema_simple: Schema) -> None:
@@ -1069,14 +1066,9 @@ def test__fill_in_df(table_schema_simple: Schema) -> None:
     assert filled_df == expected
 
 
-def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_part_fields_in_filter() -> None:
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_part_fields_in_filter(
+    iceberg_schema_simple: Schema,
+) -> None:
     pred = EqualTo(Reference("foo"), "hello")
     partition_spec = PartitionSpec(PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"))
     import re
@@ -1087,17 +1079,14 @@ def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_part_
             "Get 0 partition fields from filter predicate EqualTo(term=Reference(name='foo'), literal=literal('hello')), expecting 1."
         ),
     ):
-        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+        _bind_and_validate_static_overwrite_filter_predicate(
+            unbound_expr=pred, table_schema=iceberg_schema_simple, spec=partition_spec
+        )
 
 
-def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_identity_transorm_filter() -> None:
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_identity_transorm_filter(
+    iceberg_schema_simple: Schema,
+) -> None:
     pred = EqualTo(Reference("foo"), "hello")
     partition_spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
@@ -1108,53 +1097,42 @@ def test__bind_and_validate_static_overwrite_filter_predicate_fails_on_non_ident
         ValueError,
         match="static overwrite partition filter can only apply to partition fields which are without hidden transform, but get.*",
     ):
-        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+        _bind_and_validate_static_overwrite_filter_predicate(
+            unbound_expr=pred, table_schema=iceberg_schema_simple, spec=partition_spec
+        )
 
 
-def test__bind_and_validate_static_overwrite_filter_predicate_succeeds_on_an_identity_transform_field_although_table_has_other_hidden_partition_fields() -> (
-    None
-):
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+def test__bind_and_validate_static_overwrite_filter_predicate_succeeds_on_an_identity_transform_field_although_table_has_other_hidden_partition_fields(
+    iceberg_schema_simple: Schema,
+) -> None:
     pred = EqualTo(Reference("bar"), 3)
     partition_spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
         PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc"),
     )
 
-    _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
-
-
-def test__bind_and_validate_static_overwrite_filter_predicate_fails_to_bind() -> None:
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
+    _bind_and_validate_static_overwrite_filter_predicate(
+        unbound_expr=pred, table_schema=iceberg_schema_simple, spec=partition_spec
     )
+
+
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_to_bind_due_to_incompatible_predicate_value(
+    iceberg_schema_simple: Schema,
+) -> None:
     pred = EqualTo(Reference("bar"), "an incompatible type")
     partition_spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="bar"),
         PartitionField(source_id=1, field_id=1002, transform=TruncateTransform(2), name="foo_trunc"),
     )
     with pytest.raises(ValueError, match="Could not convert an incompatible type into a int"):
-        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+        _bind_and_validate_static_overwrite_filter_predicate(
+            unbound_expr=pred, table_schema=iceberg_schema_simple, spec=partition_spec
+        )
 
 
-def test__bind_and_validate_static_overwrite_filter_predicate_fails_to_bind_due_to_non_nullable() -> None:
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=BooleanType(), required=False),
-        schema_id=1,
-        identifier_field_ids=[2],
-    )
+def test__bind_and_validate_static_overwrite_filter_predicate_fails_to_bind_due_to_non_nullable(
+    iceberg_schema_simple: Schema,
+) -> None:
     pred = IsNull(Reference("bar"))
     partition_spec = PartitionSpec(
         PartitionField(source_id=3, field_id=1001, transform=IdentityTransform(), name="baz"),
@@ -1166,7 +1144,9 @@ def test__bind_and_validate_static_overwrite_filter_predicate_fails_to_bind_due_
             "Static overwriting with part of the explicit partition filter not meaningful (specifing a non-nullable partition field to be null)"
         ),
     ):
-        _bind_and_validate_static_overwrite_filter_predicate(unbound_expr=pred, table_schema=test_schema, spec=partition_spec)
+        _bind_and_validate_static_overwrite_filter_predicate(
+            unbound_expr=pred, table_schema=iceberg_schema_simple, spec=partition_spec
+        )
 
 
 def test__check_schema_with_filter_succeed(iceberg_schema_simple: Schema) -> None:
@@ -1421,14 +1401,14 @@ def test_check_schema_succeed(table_schema_simple: Schema) -> None:
     _check_schema(table_schema_simple, other_schema)
 
 
-def test_schema_succeed_on_pyarrow_table_reversed_column_order(table_schema_simple: Schema) -> None:
+def test_schema_succeed_on_pyarrow_table_reversed_column_order(iceberg_schema_simple: Schema) -> None:
     other_schema = pa.schema((
         pa.field("baz", pa.bool_(), nullable=True),
         pa.field("bar", pa.int32(), nullable=False),
         pa.field("foo", pa.string(), nullable=True),
     ))
 
-    _check_schema(table_schema_simple, other_schema)
+    _check_schema(iceberg_schema_simple, other_schema)
 
 
 def test_schema_mismatch_additional_field(table_schema_simple: Schema) -> None:
