@@ -58,9 +58,7 @@ from pyiceberg.catalog import (
     LOCATION,
     METADATA_LOCATION,
     TABLE_TYPE,
-    Catalog,
-    Identifier,
-    Properties,
+    MetastoreCatalog,
     PropertiesUpdateSummary,
 )
 from pyiceberg.exceptions import (
@@ -79,7 +77,7 @@ from pyiceberg.serializers import FromInputFile
 from pyiceberg.table import CommitTableRequest, CommitTableResponse, Table, TableProperties, update_table_metadata
 from pyiceberg.table.metadata import new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
-from pyiceberg.typedef import EMPTY_DICT
+from pyiceberg.typedef import EMPTY_DICT, Identifier, Properties
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -232,7 +230,7 @@ class SchemaToHiveConverter(SchemaVisitor[str]):
             return HIVE_PRIMITIVE_TYPES[type(primitive)]
 
 
-class HiveCatalog(Catalog):
+class HiveCatalog(MetastoreCatalog):
     _client: _HiveClient
 
     def __init__(self, name: str, **properties: str):

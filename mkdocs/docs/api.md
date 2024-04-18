@@ -165,6 +165,25 @@ catalog.create_table(
 )
 ```
 
+To create a table with some subsequent changes atomically in a transaction:
+
+```python
+with catalog.create_table_transaction(
+    identifier="docs_example.bids",
+    schema=schema,
+    location="s3://pyiceberg",
+    partition_spec=partition_spec,
+    sort_order=sort_order,
+) as txn:
+    with txn.update_schema() as update_schema:
+        update_schema.add_column(path="new_column", field_type=StringType())
+
+    with txn.update_spec() as update_spec:
+        update_spec.add_identity("symbol")
+
+    txn.set_properties(test_a="test_aa", test_b="test_b", test_c="test_c")
+```
+
 ## Load a table
 
 ### Catalog table
@@ -193,6 +212,16 @@ static_table = StaticTable.from_metadata(
 ```
 
 The static-table is considered read-only.
+
+## Check if a table exists
+
+To check whether the `bids` table exists:
+
+```python
+catalog.table_exists("docs_example.bids")
+```
+
+Returns `True` if the table already exists.
 
 ## Write support
 
@@ -285,10 +314,249 @@ long: [[4.896029,-122.431297,6.0989,2.349014],[6.56667]]
 
 The nested lists indicate the different Arrow buffers, where the first write results into a buffer, and the second append in a separate buffer. This is expected since it will read two parquet files.
 
+To avoid any type errors during writing, you can enforce the PyArrow table types using the Iceberg table schema:
+
+```python
+from pyiceberg.catalog import load_catalog
+import pyarrow as pa
+
+catalog = load_catalog("default")
+table = catalog.load_table("default.cities")
+schema = table.schema().as_arrow()
+
+df = pa.Table.from_pylist(
+    [{"city": "Groningen", "lat": 53.21917, "long": 6.56667}], schema=schema
+)
+
+table.append(df)
+```
+
 <!-- prettier-ignore-start -->
 
 !!! example "Under development"
     Writing using PyIceberg is still under development. Support for [partial overwrites](https://github.com/apache/iceberg-python/issues/268) and writing to [partitioned tables](https://github.com/apache/iceberg-python/issues/208) is planned and being worked on.
+
+<!-- prettier-ignore-end -->
+
+## Inspecting tables
+
+To explore the table metadata, tables can be inspected.
+
+### Snapshots
+
+Inspect the snapshots of the table:
+
+```python
+table.inspect.snapshots()
+```
+
+```
+pyarrow.Table
+committed_at: timestamp[ms] not null
+snapshot_id: int64 not null
+parent_id: int64
+operation: string
+manifest_list: string not null
+summary: map<string, string>
+  child 0, entries: struct<key: string not null, value: string> not null
+      child 0, key: string not null
+      child 1, value: string
+----
+committed_at: [[2024-03-15 15:01:25.682,2024-03-15 15:01:25.730,2024-03-15 15:01:25.772]]
+snapshot_id: [[805611270568163028,3679426539959220963,5588071473139865870]]
+parent_id: [[null,805611270568163028,3679426539959220963]]
+operation: [["append","overwrite","append"]]
+manifest_list: [["s3://warehouse/default/table_metadata_snapshots/metadata/snap-805611270568163028-0-43637daf-ea4b-4ceb-b096-a60c25481eb5.avro","s3://warehouse/default/table_metadata_snapshots/metadata/snap-3679426539959220963-0-8be81019-adf1-4bb6-a127-e15217bd50b3.avro","s3://warehouse/default/table_metadata_snapshots/metadata/snap-5588071473139865870-0-1382dd7e-5fbc-4c51-9776-a832d7d0984e.avro"]]
+summary: [[keys:["added-files-size","added-data-files","added-records","total-data-files","total-delete-files","total-records","total-files-size","total-position-deletes","total-equality-deletes"]values:["5459","1","3","1","0","3","5459","0","0"],keys:["added-files-size","added-data-files","added-records","total-data-files","total-records",...,"total-equality-deletes","total-files-size","deleted-data-files","deleted-records","removed-files-size"]values:["5459","1","3","1","3",...,"0","5459","1","3","5459"],keys:["added-files-size","added-data-files","added-records","total-data-files","total-delete-files","total-records","total-files-size","total-position-deletes","total-equality-deletes"]values:["5459","1","3","2","0","6","10918","0","0"]]]
+```
+
+### Entries
+
+To show all the table's current manifest entries for both data and delete files.
+
+```python
+table.inspect.entries()
+```
+
+```
+pyarrow.Table
+status: int8 not null
+snapshot_id: int64 not null
+sequence_number: int64 not null
+file_sequence_number: int64 not null
+data_file: struct<content: int8 not null, file_path: string not null, file_format: string not null, partition: struct<> not null, record_count: int64 not null, file_size_in_bytes: int64 not null, column_sizes: map<int32, int64>, value_counts: map<int32, int64>, null_value_counts: map<int32, int64>, nan_value_counts: map<int32, int64>, lower_bounds: map<int32, binary>, upper_bounds: map<int32, binary>, key_metadata: binary, split_offsets: list<item: int64>, equality_ids: list<item: int32>, sort_order_id: int32> not null
+  child 0, content: int8 not null
+  child 1, file_path: string not null
+  child 2, file_format: string not null
+  child 3, partition: struct<> not null
+  child 4, record_count: int64 not null
+  child 5, file_size_in_bytes: int64 not null
+  child 6, column_sizes: map<int32, int64>
+      child 0, entries: struct<key: int32 not null, value: int64> not null
+          child 0, key: int32 not null
+          child 1, value: int64
+  child 7, value_counts: map<int32, int64>
+      child 0, entries: struct<key: int32 not null, value: int64> not null
+          child 0, key: int32 not null
+          child 1, value: int64
+  child 8, null_value_counts: map<int32, int64>
+      child 0, entries: struct<key: int32 not null, value: int64> not null
+          child 0, key: int32 not null
+          child 1, value: int64
+  child 9, nan_value_counts: map<int32, int64>
+      child 0, entries: struct<key: int32 not null, value: int64> not null
+          child 0, key: int32 not null
+          child 1, value: int64
+  child 10, lower_bounds: map<int32, binary>
+      child 0, entries: struct<key: int32 not null, value: binary> not null
+          child 0, key: int32 not null
+          child 1, value: binary
+  child 11, upper_bounds: map<int32, binary>
+      child 0, entries: struct<key: int32 not null, value: binary> not null
+          child 0, key: int32 not null
+          child 1, value: binary
+  child 12, key_metadata: binary
+  child 13, split_offsets: list<item: int64>
+      child 0, item: int64
+  child 14, equality_ids: list<item: int32>
+      child 0, item: int32
+  child 15, sort_order_id: int32
+readable_metrics: struct<city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null, lat: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null, long: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null>
+  child 0, city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null
+      child 0, column_size: int64
+      child 1, value_count: int64
+      child 2, null_value_count: int64
+      child 3, nan_value_count: int64
+      child 4, lower_bound: string
+      child 5, upper_bound: string
+  child 1, lat: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null
+      child 0, column_size: int64
+      child 1, value_count: int64
+      child 2, null_value_count: int64
+      child 3, nan_value_count: int64
+      child 4, lower_bound: double
+      child 5, upper_bound: double
+  child 2, long: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null
+      child 0, column_size: int64
+      child 1, value_count: int64
+      child 2, null_value_count: int64
+      child 3, nan_value_count: int64
+      child 4, lower_bound: double
+      child 5, upper_bound: double
+----
+status: [[1]]
+snapshot_id: [[6245626162224016531]]
+sequence_number: [[1]]
+file_sequence_number: [[1]]
+data_file: [
+  -- is_valid: all not null
+  -- child 0 type: int8
+[0]
+  -- child 1 type: string
+["s3://warehouse/default/cities/data/00000-0-80766b66-e558-4150-a5cf-85e4c609b9fe.parquet"]
+  -- child 2 type: string
+["PARQUET"]
+  -- child 3 type: struct<>
+    -- is_valid: all not null
+  -- child 4 type: int64
+[4]
+  -- child 5 type: int64
+[1656]
+  -- child 6 type: map<int32, int64>
+[keys:[1,2,3]values:[140,135,135]]
+  -- child 7 type: map<int32, int64>
+[keys:[1,2,3]values:[4,4,4]]
+  -- child 8 type: map<int32, int64>
+[keys:[1,2,3]values:[0,0,0]]
+  -- child 9 type: map<int32, int64>
+[keys:[]values:[]]
+  -- child 10 type: map<int32, binary>
+[keys:[1,2,3]values:[416D7374657264616D,8602B68311E34240,3A77BB5E9A9B5EC0]]
+  -- child 11 type: map<int32, binary>
+[keys:[1,2,3]values:[53616E204672616E636973636F,F5BEF1B5678E4A40,304CA60A46651840]]
+  -- child 12 type: binary
+[null]
+  -- child 13 type: list<item: int64>
+[[4]]
+  -- child 14 type: list<item: int32>
+[null]
+  -- child 15 type: int32
+[null]]
+readable_metrics: [
+  -- is_valid: all not null
+  -- child 0 type: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string>
+    -- is_valid: all not null
+    -- child 0 type: int64
+[140]
+    -- child 1 type: int64
+[4]
+    -- child 2 type: int64
+[0]
+    -- child 3 type: int64
+[null]
+    -- child 4 type: string
+["Amsterdam"]
+    -- child 5 type: string
+["San Francisco"]
+  -- child 1 type: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double>
+    -- is_valid: all not null
+    -- child 0 type: int64
+[135]
+    -- child 1 type: int64
+[4]
+    -- child 2 type: int64
+[0]
+    -- child 3 type: int64
+[null]
+    -- child 4 type: double
+[37.773972]
+    -- child 5 type: double
+[53.11254]
+  -- child 2 type: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double>
+    -- is_valid: all not null
+    -- child 0 type: int64
+[135]
+    -- child 1 type: int64
+[4]
+    -- child 2 type: int64
+[0]
+    -- child 3 type: int64
+[null]
+    -- child 4 type: double
+[-122.431297]
+    -- child 5 type: double
+[6.0989]]
+```
+
+## Add Files
+
+Expert Iceberg users may choose to commit existing parquet files to the Iceberg table as data files, without rewriting them.
+
+```
+# Given that these parquet files have schema consistent with the Iceberg table
+
+file_paths = [
+    "s3a://warehouse/default/existing-1.parquet",
+    "s3a://warehouse/default/existing-2.parquet",
+]
+
+# They can be added to the table without rewriting them
+
+tbl.add_files(file_paths=file_paths)
+
+# A new snapshot is committed to the table with manifests pointing to the existing parquet files
+```
+
+<!-- prettier-ignore-start -->
+
+!!! note "Name Mapping"
+    Because `add_files` uses existing files without writing new parquet files that are aware of the Iceberg's schema, it requires the Iceberg's table to have a [Name Mapping](https://iceberg.apache.org/spec/?h=name+mapping#name-mapping-serialization) (The Name mapping maps the field names within the parquet files to the Iceberg field IDs). Hence, `add_files` requires that there are no field IDs in the parquet file's metadata, and creates a new Name Mapping based on the table's current schema if the table doesn't already have one.
+
+!!! note "Partitions"
+    `add_files` only requires the client to read the existing parquet files' metadata footer to infer the partition value of each file. This implementation also supports adding files to Iceberg tables with partition transforms like `MonthTransform`, and `TruncateTransform` which preserve the order of the values after the transformation (Any Transform that has the `preserves_order` property set to True is supported). Please note that if the column statistics of the `PartitionField`'s source column are not present in the parquet metadata, the partition value is inferred as `None`.
+
+!!! warning "Maintenance Operations"
+    Because `add_files` commits the existing parquet files to the Iceberg Table as any other data file, destructive maintenance operations like expiring snapshots will remove them.
 
 <!-- prettier-ignore-end -->
 
@@ -501,6 +769,20 @@ assert table.properties == {"abc": "def"}
 table = table.transaction().remove_properties("abc").commit_transaction()
 
 assert table.properties == {}
+```
+
+## Snapshot properties
+
+Optionally, Snapshot properties can be set while writing to a table using `append` or `overwrite` API:
+
+```python
+tbl.append(df, snapshot_properties={"abc": "def"})
+
+# or
+
+tbl.overwrite(df, snapshot_properties={"abc": "def"})
+
+assert tbl.metadata.snapshots[-1].summary["abc"] == "def"
 ```
 
 ## Query the data

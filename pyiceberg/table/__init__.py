@@ -43,12 +43,12 @@ from typing import (
     Union,
 )
 
-import pyarrow.compute as pc
-from pyarrow import uint64
-from pydantic import Field, SerializeAsAny
+from pydantic import Field, field_validator
 from sortedcontainers import SortedList
 from typing_extensions import Annotated
 
+import pyiceberg.expressions.parser as parser
+from pyiceberg.conversions import from_bytes
 from pyiceberg.exceptions import CommitFailedException, ResolveError, ValidationError
 from pyiceberg.expressions import (
     AlwaysTrue,
@@ -56,10 +56,13 @@ from pyiceberg.expressions import (
     BooleanExpression,
     EqualTo,
     Reference,
-    parser,
-    visitors,
 )
-from pyiceberg.expressions.visitors import _InclusiveMetricsEvaluator, inclusive_projection
+from pyiceberg.expressions.visitors import (
+    _InclusiveMetricsEvaluator,
+    expression_evaluator,
+    inclusive_projection,
+    manifest_evaluator,
+)
 from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import (
     POSITIONAL_DELETE_SCHEMA,
@@ -75,7 +78,7 @@ from pyiceberg.manifest import (
 from pyiceberg.partitioning import (
     INITIAL_PARTITION_SPEC_ID,
     PARTITION_FIELD_ID_START,
-    IdentityTransform,
+    UNPARTITIONED_PARTITION_SPEC,
     PartitionField,
     PartitionFieldValue,
     PartitionKey,
@@ -114,9 +117,18 @@ from pyiceberg.table.snapshots import (
     Summary,
     update_snapshot_summaries,
 )
-from pyiceberg.table.sorting import SortOrder
-from pyiceberg.transforms import TimeTransform, Transform, VoidTransform
-from pyiceberg.typedef import EMPTY_DICT, IcebergBaseModel, IcebergRootModel, Identifier, KeyDefaultDict, Properties, Record
+from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
+from pyiceberg.transforms import IdentityTransform, TimeTransform, Transform, VoidTransform
+from pyiceberg.typedef import (
+    EMPTY_DICT,
+    IcebergBaseModel,
+    IcebergRootModel,
+    Identifier,
+    KeyDefaultDict,
+    Properties,
+    Record,
+    TableVersion,
+)
 from pyiceberg.types import (
     IcebergType,
     ListType,
@@ -124,6 +136,7 @@ from pyiceberg.types import (
     NestedField,
     PrimitiveType,
     StructType,
+    transform_dict_value_to_str,
 )
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.datetime import datetime_to_millis
@@ -137,14 +150,21 @@ if TYPE_CHECKING:
 
     from pyiceberg.catalog import Catalog
 
-
 ALWAYS_TRUE = AlwaysTrue()
 TABLE_ROOT_ID = -1
 
 _JAVA_LONG_MAX = 9223372036854775807
 
 
-def _check_schema(table_schema: Schema, other_schema: "pa.Schema") -> None:
+def _check_schema_compatible(table_schema: Schema, other_schema: "pa.Schema") -> None:
+    """
+    Check if the `table_schema` is compatible with `other_schema`.
+
+    Two schemas are considered compatible when they are equal in terms of the Iceberg Schema type.
+
+    Raises:
+        ValueError: If the schemas are not compatible.
+    """
     from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
 
     name_mapping = table_schema.name_mapping
@@ -206,10 +226,16 @@ class TableProperties:
 
     PARQUET_BLOOM_FILTER_COLUMN_ENABLED_PREFIX = "write.parquet.bloom-filter-enabled.column"
 
+    WRITE_TARGET_FILE_SIZE_BYTES = "write.target-file-size-bytes"
+    WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT = 512 * 1024 * 1024  # 512 MB
+
     DEFAULT_WRITE_METRICS_MODE = "write.metadata.metrics.default"
     DEFAULT_WRITE_METRICS_MODE_DEFAULT = "truncate(16)"
 
     METRICS_MODE_COLUMN_CONF_PREFIX = "write.metadata.metrics.column"
+
+    WRITE_PARTITION_SUMMARY_LIMIT = "write.summary.partition-limit"
+    WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT = 0
 
     DEFAULT_NAME_MAPPING = "schema.name-mapping.default"
     FORMAT_VERSION = "format-version"
@@ -313,7 +339,7 @@ class Transaction:
 
         return self
 
-    def upgrade_table_version(self, format_version: Literal[1, 2]) -> Transaction:
+    def upgrade_table_version(self, format_version: TableVersion) -> Transaction:
         """Set the table to a certain version.
 
         Args:
@@ -333,17 +359,21 @@ class Transaction:
 
         return self
 
-    def set_properties(self, **updates: str) -> Transaction:
+    def set_properties(self, properties: Properties = EMPTY_DICT, **kwargs: Any) -> Transaction:
         """Set properties.
 
         When a property is already set, it will be overwritten.
 
         Args:
-            updates: The properties set on the table.
+            properties: The properties set on the table.
+            kwargs: properties can also be pass as kwargs.
 
         Returns:
             The alter table builder.
         """
+        if properties and kwargs:
+            raise ValueError("Cannot pass both properties and kwargs")
+        updates = properties or kwargs
         return self._apply((SetPropertiesUpdate(updates=updates),))
 
     def update_schema(self, allow_incompatible_changes: bool = False, case_sensitive: bool = True) -> UpdateSchema:
@@ -356,15 +386,117 @@ class Transaction:
         Returns:
             A new UpdateSchema.
         """
-        return UpdateSchema(self, allow_incompatible_changes=allow_incompatible_changes, case_sensitive=case_sensitive)
+        return UpdateSchema(
+            self,
+            allow_incompatible_changes=allow_incompatible_changes,
+            case_sensitive=case_sensitive,
+            name_mapping=self._table.name_mapping(),
+        )
 
-    def update_snapshot(self) -> UpdateSnapshot:
+    def update_snapshot(self, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> UpdateSnapshot:
         """Create a new UpdateSnapshot to produce a new snapshot for the table.
 
         Returns:
             A new UpdateSnapshot
         """
-        return UpdateSnapshot(self, io=self._table.io)
+        return UpdateSnapshot(self, io=self._table.io, snapshot_properties=snapshot_properties)
+
+    def append(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
+        """
+        Shorthand API for appending a PyArrow table to a table transaction.
+
+        Args:
+            df: The Arrow dataframe that will be appended to overwrite the table
+            snapshot_properties: Custom properties to be added to the snapshot summary
+        """
+        try:
+            import pyarrow as pa
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
+
+        if not isinstance(df, pa.Table):
+            raise ValueError(f"Expected PyArrow table, got: {df}")
+
+        supported_transforms = {IdentityTransform}
+        if not all(type(field.transform) in supported_transforms for field in self.table_metadata.spec().fields):
+            raise ValueError(
+                f"All transforms are not supported, expected: {supported_transforms}, but get: {[str(field) for field in self.table_metadata.spec().fields if field.transform not in supported_transforms]}."
+            )
+
+        _check_schema_compatible(self._table.schema(), other_schema=df.schema)
+        # cast if the two schemas are compatible but not equal
+        table_arrow_schema = self._table.schema().as_arrow()
+        if table_arrow_schema != df.schema:
+            df = df.cast(table_arrow_schema)
+
+        with self.update_snapshot(snapshot_properties=snapshot_properties).fast_append() as update_snapshot:
+            # skip writing data files if the dataframe is empty
+            if df.shape[0] > 0:
+                data_files = _dataframe_to_data_files(
+                    table_metadata=self._table.metadata, write_uuid=update_snapshot.commit_uuid, df=df, io=self._table.io
+                )
+                for data_file in data_files:
+                    update_snapshot.append_data_file(data_file)
+
+    def overwrite(
+        self, df: pa.Table, overwrite_filter: BooleanExpression = ALWAYS_TRUE, snapshot_properties: Dict[str, str] = EMPTY_DICT
+    ) -> None:
+        """
+        Shorthand for adding a table overwrite with a PyArrow table to the transaction.
+
+        Args:
+            df: The Arrow dataframe that will be used to overwrite the table
+            overwrite_filter: ALWAYS_TRUE when you overwrite all the data,
+                              or a boolean expression in case of a partial overwrite
+            snapshot_properties: Custom properties to be added to the snapshot summary
+        """
+        try:
+            import pyarrow as pa
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
+
+        if not isinstance(df, pa.Table):
+            raise ValueError(f"Expected PyArrow table, got: {df}")
+
+        if overwrite_filter != AlwaysTrue():
+            raise NotImplementedError("Cannot overwrite a subset of a table")
+
+        if len(self._table.spec().fields) > 0:
+            raise ValueError("Cannot write to partitioned tables")
+
+        _check_schema_compatible(self._table.schema(), other_schema=df.schema)
+        # cast if the two schemas are compatible but not equal
+        table_arrow_schema = self._table.schema().as_arrow()
+        if table_arrow_schema != df.schema:
+            df = df.cast(table_arrow_schema)
+
+        with self.update_snapshot(snapshot_properties=snapshot_properties).overwrite() as update_snapshot:
+            # skip writing data files if the dataframe is empty
+            if df.shape[0] > 0:
+                data_files = _dataframe_to_data_files(
+                    table_metadata=self._table.metadata, write_uuid=update_snapshot.commit_uuid, df=df, io=self._table.io
+                )
+                for data_file in data_files:
+                    update_snapshot.append_data_file(data_file)
+
+    def add_files(self, file_paths: List[str]) -> None:
+        """
+        Shorthand API for adding files as data files to the table transaction.
+
+        Args:
+            file_paths: The list of full file paths to be added as data files to the table
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+        """
+        if self._table.name_mapping() is None:
+            self.set_properties(**{TableProperties.DEFAULT_NAME_MAPPING: self._table.schema().name_mapping.model_dump_json()})
+        with self.update_snapshot().fast_append() as update_snapshot:
+            data_files = _parquet_files_to_data_files(
+                table_metadata=self._table.metadata, file_paths=file_paths, io=self._table.io
+            )
+            for data_file in data_files:
+                update_snapshot.append_data_file(data_file)
 
     def update_spec(self) -> UpdateSpec:
         """Create a new UpdateSpec to update the partitioning of the table.
@@ -412,77 +544,115 @@ class Transaction:
             return self._table
 
 
-class TableUpdateAction(Enum):
-    upgrade_format_version = "upgrade-format-version"
-    add_schema = "add-schema"
-    set_current_schema = "set-current-schema"
-    add_spec = "add-spec"
-    set_default_spec = "set-default-spec"
-    add_sort_order = "add-sort-order"
-    set_default_sort_order = "set-default-sort-order"
-    add_snapshot = "add-snapshot"
-    set_snapshot_ref = "set-snapshot-ref"
-    remove_snapshots = "remove-snapshots"
-    remove_snapshot_ref = "remove-snapshot-ref"
-    set_location = "set-location"
-    set_properties = "set-properties"
-    remove_properties = "remove-properties"
+class CreateTableTransaction(Transaction):
+    def _initial_changes(self, table_metadata: TableMetadata) -> None:
+        """Set the initial changes that can reconstruct the initial table metadata when creating the CreateTableTransaction."""
+        self._updates += (
+            AssignUUIDUpdate(uuid=table_metadata.table_uuid),
+            UpgradeFormatVersionUpdate(format_version=table_metadata.format_version),
+        )
+
+        schema: Schema = table_metadata.schema()
+        self._updates += (
+            AddSchemaUpdate(schema_=schema, last_column_id=schema.highest_field_id, initial_change=True),
+            SetCurrentSchemaUpdate(schema_id=-1),
+        )
+
+        spec: PartitionSpec = table_metadata.spec()
+        if spec.is_unpartitioned():
+            self._updates += (AddPartitionSpecUpdate(spec=UNPARTITIONED_PARTITION_SPEC, initial_change=True),)
+        else:
+            self._updates += (AddPartitionSpecUpdate(spec=spec, initial_change=True),)
+        self._updates += (SetDefaultSpecUpdate(spec_id=-1),)
+
+        sort_order: Optional[SortOrder] = table_metadata.sort_order_by_id(table_metadata.default_sort_order_id)
+        if sort_order is None or sort_order.is_unsorted:
+            self._updates += (AddSortOrderUpdate(sort_order=UNSORTED_SORT_ORDER, initial_change=True),)
+        else:
+            self._updates += (AddSortOrderUpdate(sort_order=sort_order, initial_change=True),)
+        self._updates += (SetDefaultSortOrderUpdate(sort_order_id=-1),)
+
+        self._updates += (
+            SetLocationUpdate(location=table_metadata.location),
+            SetPropertiesUpdate(updates=table_metadata.properties),
+        )
+
+    def __init__(self, table: StagedTable):
+        super().__init__(table, autocommit=False)
+        self._initial_changes(table.metadata)
+
+    def commit_transaction(self) -> Table:
+        """Commit the changes to the catalog.
+
+        In the case of a CreateTableTransaction, the only requirement is AssertCreate.
+        Returns:
+            The table with the updates applied.
+        """
+        self._requirements = (AssertCreate(),)
+        return super().commit_transaction()
 
 
-class TableUpdate(IcebergBaseModel):
-    action: TableUpdateAction
+class AssignUUIDUpdate(IcebergBaseModel):
+    action: Literal['assign-uuid'] = Field(default="assign-uuid")
+    uuid: uuid.UUID
 
 
-class UpgradeFormatVersionUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.upgrade_format_version
+class UpgradeFormatVersionUpdate(IcebergBaseModel):
+    action: Literal['upgrade-format-version'] = Field(default="upgrade-format-version")
     format_version: int = Field(alias="format-version")
 
 
-class AddSchemaUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.add_schema
+class AddSchemaUpdate(IcebergBaseModel):
+    action: Literal['add-schema'] = Field(default="add-schema")
     schema_: Schema = Field(alias="schema")
     # This field is required: https://github.com/apache/iceberg/pull/7445
     last_column_id: int = Field(alias="last-column-id")
 
+    initial_change: bool = Field(default=False, exclude=True)
 
-class SetCurrentSchemaUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.set_current_schema
+
+class SetCurrentSchemaUpdate(IcebergBaseModel):
+    action: Literal['set-current-schema'] = Field(default="set-current-schema")
     schema_id: int = Field(
         alias="schema-id", description="Schema ID to set as current, or -1 to set last added schema", default=-1
     )
 
 
-class AddPartitionSpecUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.add_spec
+class AddPartitionSpecUpdate(IcebergBaseModel):
+    action: Literal['add-spec'] = Field(default="add-spec")
     spec: PartitionSpec
 
+    initial_change: bool = Field(default=False, exclude=True)
 
-class SetDefaultSpecUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.set_default_spec
+
+class SetDefaultSpecUpdate(IcebergBaseModel):
+    action: Literal['set-default-spec'] = Field(default="set-default-spec")
     spec_id: int = Field(
         alias="spec-id", description="Partition spec ID to set as the default, or -1 to set last added spec", default=-1
     )
 
 
-class AddSortOrderUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.add_sort_order
+class AddSortOrderUpdate(IcebergBaseModel):
+    action: Literal['add-sort-order'] = Field(default="add-sort-order")
     sort_order: SortOrder = Field(alias="sort-order")
 
+    initial_change: bool = Field(default=False, exclude=True)
 
-class SetDefaultSortOrderUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.set_default_sort_order
+
+class SetDefaultSortOrderUpdate(IcebergBaseModel):
+    action: Literal['set-default-sort-order'] = Field(default="set-default-sort-order")
     sort_order_id: int = Field(
         alias="sort-order-id", description="Sort order ID to set as the default, or -1 to set last added sort order", default=-1
     )
 
 
-class AddSnapshotUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.add_snapshot
+class AddSnapshotUpdate(IcebergBaseModel):
+    action: Literal['add-snapshot'] = Field(default="add-snapshot")
     snapshot: Snapshot
 
 
-class SetSnapshotRefUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.set_snapshot_ref
+class SetSnapshotRefUpdate(IcebergBaseModel):
+    action: Literal['set-snapshot-ref'] = Field(default="set-snapshot-ref")
     ref_name: str = Field(alias="ref-name")
     type: Literal["tag", "branch"]
     snapshot_id: int = Field(alias="snapshot-id")
@@ -491,29 +661,55 @@ class SetSnapshotRefUpdate(TableUpdate):
     min_snapshots_to_keep: Annotated[Optional[int], Field(alias="min-snapshots-to-keep", default=None)]
 
 
-class RemoveSnapshotsUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.remove_snapshots
+class RemoveSnapshotsUpdate(IcebergBaseModel):
+    action: Literal['remove-snapshots'] = Field(default="remove-snapshots")
     snapshot_ids: List[int] = Field(alias="snapshot-ids")
 
 
-class RemoveSnapshotRefUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.remove_snapshot_ref
+class RemoveSnapshotRefUpdate(IcebergBaseModel):
+    action: Literal['remove-snapshot-ref'] = Field(default="remove-snapshot-ref")
     ref_name: str = Field(alias="ref-name")
 
 
-class SetLocationUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.set_location
+class SetLocationUpdate(IcebergBaseModel):
+    action: Literal['set-location'] = Field(default="set-location")
     location: str
 
 
-class SetPropertiesUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.set_properties
+class SetPropertiesUpdate(IcebergBaseModel):
+    action: Literal['set-properties'] = Field(default="set-properties")
     updates: Dict[str, str]
 
+    @field_validator('updates', mode='before')
+    def transform_properties_dict_value_to_str(cls, properties: Properties) -> Dict[str, str]:
+        return transform_dict_value_to_str(properties)
 
-class RemovePropertiesUpdate(TableUpdate):
-    action: TableUpdateAction = TableUpdateAction.remove_properties
+
+class RemovePropertiesUpdate(IcebergBaseModel):
+    action: Literal['remove-properties'] = Field(default="remove-properties")
     removals: List[str]
+
+
+TableUpdate = Annotated[
+    Union[
+        AssignUUIDUpdate,
+        UpgradeFormatVersionUpdate,
+        AddSchemaUpdate,
+        SetCurrentSchemaUpdate,
+        AddPartitionSpecUpdate,
+        SetDefaultSpecUpdate,
+        AddSortOrderUpdate,
+        SetDefaultSortOrderUpdate,
+        AddSnapshotUpdate,
+        SetSnapshotRefUpdate,
+        RemoveSnapshotsUpdate,
+        RemoveSnapshotRefUpdate,
+        SetLocationUpdate,
+        SetPropertiesUpdate,
+        RemovePropertiesUpdate,
+    ],
+    Field(discriminator='action'),
+]
 
 
 class _TableMetadataUpdateContext:
@@ -527,21 +723,18 @@ class _TableMetadataUpdateContext:
 
     def is_added_snapshot(self, snapshot_id: int) -> bool:
         return any(
-            update.snapshot.snapshot_id == snapshot_id
-            for update in self._updates
-            if update.action == TableUpdateAction.add_snapshot
+            update.snapshot.snapshot_id == snapshot_id for update in self._updates if isinstance(update, AddSnapshotUpdate)
         )
 
     def is_added_schema(self, schema_id: int) -> bool:
-        return any(
-            update.schema_.schema_id == schema_id for update in self._updates if update.action == TableUpdateAction.add_schema
-        )
+        return any(update.schema_.schema_id == schema_id for update in self._updates if isinstance(update, AddSchemaUpdate))
+
+    def is_added_partition_spec(self, spec_id: int) -> bool:
+        return any(update.spec.spec_id == spec_id for update in self._updates if isinstance(update, AddPartitionSpecUpdate))
 
     def is_added_sort_order(self, sort_order_id: int) -> bool:
         return any(
-            update.sort_order.order_id == sort_order_id
-            for update in self._updates
-            if update.action == TableUpdateAction.add_sort_order
+            update.sort_order.order_id == sort_order_id for update in self._updates if isinstance(update, AddSortOrderUpdate)
         )
 
 
@@ -561,8 +754,27 @@ def _apply_table_update(update: TableUpdate, base_metadata: TableMetadata, conte
     raise NotImplementedError(f"Unsupported table update: {update}")
 
 
+@_apply_table_update.register(AssignUUIDUpdate)
+def _(update: AssignUUIDUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    if update.uuid == base_metadata.table_uuid:
+        return base_metadata
+
+    context.add_update(update)
+    return base_metadata.model_copy(update={"table_uuid": update.uuid})
+
+
+@_apply_table_update.register(SetLocationUpdate)
+def _(update: SetLocationUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    context.add_update(update)
+    return base_metadata.model_copy(update={"location": update.location})
+
+
 @_apply_table_update.register(UpgradeFormatVersionUpdate)
-def _(update: UpgradeFormatVersionUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+def _(
+    update: UpgradeFormatVersionUpdate,
+    base_metadata: TableMetadata,
+    context: _TableMetadataUpdateContext,
+) -> TableMetadata:
     if update.format_version > SUPPORTED_TABLE_FORMAT_VERSION:
         raise ValueError(f"Unsupported table format version: {update.format_version}")
     elif update.format_version < base_metadata.format_version:
@@ -607,13 +819,13 @@ def _(update: AddSchemaUpdate, base_metadata: TableMetadata, context: _TableMeta
     if update.last_column_id < base_metadata.last_column_id:
         raise ValueError(f"Invalid last column id {update.last_column_id}, must be >= {base_metadata.last_column_id}")
 
+    metadata_updates: Dict[str, Any] = {
+        "last_column_id": update.last_column_id,
+        "schemas": [update.schema_] if update.initial_change else base_metadata.schemas + [update.schema_],
+    }
+
     context.add_update(update)
-    return base_metadata.model_copy(
-        update={
-            "last_column_id": update.last_column_id,
-            "schemas": base_metadata.schemas + [update.schema_],
-        }
-    )
+    return base_metadata.model_copy(update=metadata_updates)
 
 
 @_apply_table_update.register(SetCurrentSchemaUpdate)
@@ -639,18 +851,19 @@ def _(update: SetCurrentSchemaUpdate, base_metadata: TableMetadata, context: _Ta
 @_apply_table_update.register(AddPartitionSpecUpdate)
 def _(update: AddPartitionSpecUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
     for spec in base_metadata.partition_specs:
-        if spec.spec_id == update.spec.spec_id:
+        if spec.spec_id == update.spec.spec_id and not update.initial_change:
             raise ValueError(f"Partition spec with id {spec.spec_id} already exists: {spec}")
+
+    metadata_updates: Dict[str, Any] = {
+        "partition_specs": [update.spec] if update.initial_change else base_metadata.partition_specs + [update.spec],
+        "last_partition_id": max(
+            max([field.field_id for field in update.spec.fields], default=0),
+            base_metadata.last_partition_id or PARTITION_FIELD_ID_START - 1,
+        ),
+    }
+
     context.add_update(update)
-    return base_metadata.model_copy(
-        update={
-            "partition_specs": base_metadata.partition_specs + [update.spec],
-            "last_partition_id": max(
-                max(field.field_id for field in update.spec.fields),
-                base_metadata.last_partition_id or PARTITION_FIELD_ID_START - 1,
-            ),
-        }
-    )
+    return base_metadata.model_copy(update=metadata_updates)
 
 
 @_apply_table_update.register(SetDefaultSpecUpdate)
@@ -658,6 +871,8 @@ def _(update: SetDefaultSpecUpdate, base_metadata: TableMetadata, context: _Tabl
     new_spec_id = update.spec_id
     if new_spec_id == -1:
         new_spec_id = max(spec.spec_id for spec in base_metadata.partition_specs)
+        if not context.is_added_partition_spec(new_spec_id):
+            raise ValueError("Cannot set current partition spec to last added one when no partition spec has been added")
     if new_spec_id == base_metadata.default_spec_id:
         return base_metadata
     found_spec_id = False
@@ -748,13 +963,17 @@ def _(update: AddSortOrderUpdate, base_metadata: TableMetadata, context: _TableM
     context.add_update(update)
     return base_metadata.model_copy(
         update={
-            "sort_orders": base_metadata.sort_orders + [update.sort_order],
+            "sort_orders": [update.sort_order] if update.initial_change else base_metadata.sort_orders + [update.sort_order],
         }
     )
 
 
 @_apply_table_update.register(SetDefaultSortOrderUpdate)
-def _(update: SetDefaultSortOrderUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+def _(
+    update: SetDefaultSortOrderUpdate,
+    base_metadata: TableMetadata,
+    context: _TableMetadataUpdateContext,
+) -> TableMetadata:
     new_sort_order_id = update.sort_order_id
     if new_sort_order_id == -1:
         # The last added sort order should be in base_metadata.sort_orders at this point
@@ -773,12 +992,15 @@ def _(update: SetDefaultSortOrderUpdate, base_metadata: TableMetadata, context: 
     return base_metadata.model_copy(update={"default_sort_order_id": new_sort_order_id})
 
 
-def update_table_metadata(base_metadata: TableMetadata, updates: Tuple[TableUpdate, ...]) -> TableMetadata:
+def update_table_metadata(
+    base_metadata: TableMetadata, updates: Tuple[TableUpdate, ...], enforce_validation: bool = False
+) -> TableMetadata:
     """Update the table metadata with the given updates in one transaction.
 
     Args:
         base_metadata: The base metadata to be updated.
         updates: The updates in one transaction.
+        enforce_validation: Whether to trigger validation after applying the updates.
 
     Returns:
         The metadata with the updates applied.
@@ -789,10 +1011,13 @@ def update_table_metadata(base_metadata: TableMetadata, updates: Tuple[TableUpda
     for update in updates:
         new_metadata = _apply_table_update(update, new_metadata, context)
 
-    return new_metadata.model_copy(deep=True)
+    if enforce_validation:
+        return TableMetadataUtil.parse_obj(new_metadata.model_dump())
+    else:
+        return new_metadata.model_copy(deep=True)
 
 
-class TableRequirement(IcebergBaseModel):
+class ValidatableTableRequirement(IcebergBaseModel):
     type: str
 
     @abstractmethod
@@ -808,7 +1033,7 @@ class TableRequirement(IcebergBaseModel):
         ...
 
 
-class AssertCreate(TableRequirement):
+class AssertCreate(ValidatableTableRequirement):
     """The table must not already exist; used for create transactions."""
 
     type: Literal["assert-create"] = Field(default="assert-create")
@@ -818,7 +1043,7 @@ class AssertCreate(TableRequirement):
             raise CommitFailedException("Table already exists")
 
 
-class AssertTableUUID(TableRequirement):
+class AssertTableUUID(ValidatableTableRequirement):
     """The table UUID must match the requirement's `uuid`."""
 
     type: Literal["assert-table-uuid"] = Field(default="assert-table-uuid")
@@ -831,7 +1056,7 @@ class AssertTableUUID(TableRequirement):
             raise CommitFailedException(f"Table UUID does not match: {self.uuid} != {base_metadata.table_uuid}")
 
 
-class AssertRefSnapshotId(TableRequirement):
+class AssertRefSnapshotId(ValidatableTableRequirement):
     """The table branch or tag identified by the requirement's `ref` must reference the requirement's `snapshot-id`.
 
     if `snapshot-id` is `null` or missing, the ref must not already exist.
@@ -856,7 +1081,7 @@ class AssertRefSnapshotId(TableRequirement):
             raise CommitFailedException(f"Requirement failed: branch or tag {self.ref} is missing, expected {self.snapshot_id}")
 
 
-class AssertLastAssignedFieldId(TableRequirement):
+class AssertLastAssignedFieldId(ValidatableTableRequirement):
     """The table's last assigned column id must match the requirement's `last-assigned-field-id`."""
 
     type: Literal["assert-last-assigned-field-id"] = Field(default="assert-last-assigned-field-id")
@@ -871,7 +1096,7 @@ class AssertLastAssignedFieldId(TableRequirement):
             )
 
 
-class AssertCurrentSchemaId(TableRequirement):
+class AssertCurrentSchemaId(ValidatableTableRequirement):
     """The table's current schema id must match the requirement's `current-schema-id`."""
 
     type: Literal["assert-current-schema-id"] = Field(default="assert-current-schema-id")
@@ -886,7 +1111,7 @@ class AssertCurrentSchemaId(TableRequirement):
             )
 
 
-class AssertLastAssignedPartitionId(TableRequirement):
+class AssertLastAssignedPartitionId(ValidatableTableRequirement):
     """The table's last assigned partition id must match the requirement's `last-assigned-partition-id`."""
 
     type: Literal["assert-last-assigned-partition-id"] = Field(default="assert-last-assigned-partition-id")
@@ -901,7 +1126,7 @@ class AssertLastAssignedPartitionId(TableRequirement):
             )
 
 
-class AssertDefaultSpecId(TableRequirement):
+class AssertDefaultSpecId(ValidatableTableRequirement):
     """The table's default spec id must match the requirement's `default-spec-id`."""
 
     type: Literal["assert-default-spec-id"] = Field(default="assert-default-spec-id")
@@ -916,7 +1141,7 @@ class AssertDefaultSpecId(TableRequirement):
             )
 
 
-class AssertDefaultSortOrderId(TableRequirement):
+class AssertDefaultSortOrderId(ValidatableTableRequirement):
     """The table's default sort order id must match the requirement's `default-sort-order-id`."""
 
     type: Literal["assert-default-sort-order-id"] = Field(default="assert-default-sort-order-id")
@@ -930,6 +1155,20 @@ class AssertDefaultSortOrderId(TableRequirement):
                 f"Requirement failed: default sort order id has changed: expected {self.default_sort_order_id}, found {base_metadata.default_sort_order_id}"
             )
 
+
+TableRequirement = Annotated[
+    Union[
+        AssertCreate,
+        AssertTableUUID,
+        AssertRefSnapshotId,
+        AssertLastAssignedFieldId,
+        AssertCurrentSchemaId,
+        AssertLastAssignedPartitionId,
+        AssertDefaultSpecId,
+        AssertDefaultSortOrderId,
+    ],
+    Field(discriminator='type'),
+]
 
 UpdatesAndRequirements = Tuple[Tuple[TableUpdate, ...], Tuple[TableRequirement, ...]]
 
@@ -952,8 +1191,8 @@ class TableIdentifier(IcebergBaseModel):
 
 class CommitTableRequest(IcebergBaseModel):
     identifier: TableIdentifier = Field()
-    requirements: Tuple[SerializeAsAny[TableRequirement], ...] = Field(default_factory=tuple)
-    updates: Tuple[SerializeAsAny[TableUpdate], ...] = Field(default_factory=tuple)
+    requirements: Tuple[TableRequirement, ...] = Field(default_factory=tuple)
+    updates: Tuple[TableUpdate, ...] = Field(default_factory=tuple)
 
 
 class CommitTableResponse(IcebergBaseModel):
@@ -984,6 +1223,11 @@ class Table:
             The transaction object
         """
         return Transaction(self)
+
+    @property
+    def inspect(self) -> InspectTable:
+        """Return the InspectTable object to browse the table metadata."""
+        return InspectTable(self)
 
     def refresh(self) -> Table:
         """Refresh the current table metadata."""
@@ -1017,7 +1261,7 @@ class Table:
         )
 
     @property
-    def format_version(self) -> Literal[1, 2]:
+    def format_version(self) -> TableVersion:
         return self.metadata.format_version
 
     def schema(self) -> Schema:
@@ -1109,57 +1353,20 @@ class Table:
         else:
             return None
 
-    def append(self, df: pa.Table) -> None:
+    def append(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
         """
         Shorthand API for appending a PyArrow table to the table.
 
         Args:
             df: The Arrow dataframe that will be appended to overwrite the table
+            snapshot_properties: Custom properties to be added to the snapshot summary
         """
-        try:
-            import pyarrow as pa
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
+        with self.transaction() as tx:
+            tx.append(df=df, snapshot_properties=snapshot_properties)
 
-        if not isinstance(df, pa.Table):
-            raise ValueError(f"Expected PyArrow table, got: {df}")
-
-        _check_schema(self.schema(), other_schema=df.schema)
-
-        with self.transaction() as txn:
-            with txn.update_snapshot().fast_append() as update_snapshot:
-                # skip writing data files if the dataframe is empty
-                if df.shape[0] > 0:
-                    data_files = _dataframe_to_data_files(
-                        table_metadata=self.metadata, write_uuid=update_snapshot.commit_uuid, df=df, io=self.io
-                    )
-                    for data_file in data_files:
-                        update_snapshot.append_data_file(data_file)
-
-    # to discuss whether we want a table property like partition_overwrite_mode in the pyiceberg monthly sync
-    def dynamic_overwrite(self, df: pa.Table) -> None:
-        try:
-            import pyarrow as pa
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
-
-        if not isinstance(df, pa.Table):
-            raise ValueError(f"Expected PyArrow table, got: {df}")
-
-        _check_schema(self.schema(), other_schema=df.schema)
-
-        with self.transaction() as txn:
-            with txn.update_snapshot().dynamic_overwrite() as update_snapshot:
-                # skip writing data files if the dataframe is empty
-                if df.shape[0] > 0:
-                    data_files = _dataframe_to_data_files(
-                        table_metadata=self.metadata, write_uuid=update_snapshot.commit_uuid, df=df, io=self.io
-                    )
-                    for data_file in data_files:
-                        update_snapshot.append_data_file(data_file)
-                        update_snapshot.delete_partition(data_file.partition)
-
-    def overwrite(self, df: pa.Table, overwrite_filter: Union[str, BooleanExpression] = ALWAYS_TRUE) -> None:
+    def overwrite(
+        self, df: pa.Table, overwrite_filter: BooleanExpression = ALWAYS_TRUE, snapshot_properties: Dict[str, str] = EMPTY_DICT
+    ) -> None:
         """
         Shorthand for overwriting the table with a PyArrow table.
 
@@ -1167,26 +1374,23 @@ class Table:
             df: The Arrow dataframe that will be used to overwrite the table
             overwrite_filter: ALWAYS_TRUE when you overwrite all the data,
                               or a boolean expression in case of a partial overwrite
+            snapshot_properties: Custom properties to be added to the snapshot summary
         """
-        try:
-            import pyarrow as pa
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
+        with self.transaction() as tx:
+            tx.overwrite(df=df, overwrite_filter=overwrite_filter, snapshot_properties=snapshot_properties)
 
-        if not isinstance(df, pa.Table):
-            raise ValueError(f"Expected PyArrow table, got: {df}")
+    def add_files(self, file_paths: List[str]) -> None:
+        """
+        Shorthand API for adding files as data files to the table.
 
-        _check_schema(self.schema(), other_schema=df.schema)
+        Args:
+            file_paths: The list of full file paths to be added as data files to the table
 
-        with self.transaction() as txn:
-            with txn.update_snapshot().overwrite(overwrite_filter) as update_snapshot:
-                # skip writing data files if the dataframe is empty
-                if df.shape[0] > 0:
-                    data_files = _dataframe_to_data_files(
-                        table_metadata=self.metadata, write_uuid=update_snapshot.commit_uuid, df=df, io=self.io
-                    )
-                    for data_file in data_files:
-                        update_snapshot.append_data_file(data_file)
+        Raises:
+            FileNotFoundError: If the file does not exist.
+        """
+        with self.transaction() as tx:
+            tx.add_files(file_paths=file_paths)
 
     def update_spec(self, case_sensitive: bool = True) -> UpdateSpec:
         return UpdateSpec(Transaction(self, autocommit=True), case_sensitive=case_sensitive)
@@ -1262,6 +1466,25 @@ class StaticTable(Table):
             io=load_file_io({**properties, **metadata.properties}),
             catalog=NoopCatalog("static-table"),
         )
+
+
+class StagedTable(Table):
+    def refresh(self) -> Table:
+        raise ValueError("Cannot refresh a staged table")
+
+    def scan(
+        self,
+        row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
+        selected_fields: Tuple[str, ...] = ("*",),
+        case_sensitive: bool = True,
+        snapshot_id: Optional[int] = None,
+        options: Properties = EMPTY_DICT,
+        limit: Optional[int] = None,
+    ) -> DataScan:
+        raise ValueError("Cannot scan a staged table")
+
+    def to_daft(self) -> daft.DataFrame:
+        raise ValueError("Cannot convert a staged table to a Daft DataFrame")
 
 
 def _parse_row_filter(expr: Union[str, BooleanExpression]) -> BooleanExpression:
@@ -1452,8 +1675,39 @@ class DataScan(TableScan):
         super().__init__(table, row_filter, selected_fields, case_sensitive, snapshot_id, options, limit)
 
     @cached_property
-    def _partition_projector(self) -> PartitionProjector:
-        return PartitionProjector(self.table.metadata, self.row_filter, self.case_sensitive)
+    def partition_filters(self) -> KeyDefaultDict[int, BooleanExpression]:
+        return KeyDefaultDict(self._build_partition_projection)
+
+    def _build_manifest_evaluator(self, spec_id: int) -> Callable[[ManifestFile], bool]:
+        spec = self.table.specs()[spec_id]
+        return manifest_evaluator(spec, self.table.schema(), self.partition_filters[spec_id], self.case_sensitive)
+
+    def _build_partition_evaluator(self, spec_id: int) -> Callable[[DataFile], bool]:
+        spec = self.table.specs()[spec_id]
+        partition_type = spec.partition_type(self.table.schema())
+        partition_schema = Schema(*partition_type.fields)
+        partition_expr = self.partition_filters[spec_id]
+
+        # The lambda created here is run in multiple threads.
+        # So we avoid creating _EvaluatorExpression methods bound to a single
+        # shared instance across multiple threads.
+        return lambda data_file: expression_evaluator(partition_schema, partition_expr, self.case_sensitive)(data_file.partition)
+
+    def _check_sequence_number(self, min_data_sequence_number: int, manifest: ManifestFile) -> bool:
+        """Ensure that no manifests are loaded that contain deletes that are older than the data.
+
+        Args:
+            min_data_sequence_number (int): The minimal sequence number.
+            manifest (ManifestFile): A ManifestFile that can be either data or deletes.
+
+        Returns:
+            Boolean indicating if it is either a data file, or a relevant delete file.
+        """
+        return manifest.content == ManifestContent.DATA or (
+            # Not interested in deletes that are older than the data
+            manifest.content == ManifestContent.DELETES
+            and (manifest.sequence_number or INITIAL_SEQUENCE_NUMBER) >= min_data_sequence_number
+        )
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files by filtering on the PartitionSpecs.
@@ -2436,15 +2690,10 @@ def _add_and_move_fields(
 class WriteTask:
     write_uuid: uuid.UUID
     task_id: int
-    df: pa.Table
     schema: Schema
+    record_batches: List[pa.RecordBatch]
     sort_order_id: Optional[int] = None
     partition_key: Optional[PartitionKey] = None
-
-    def generate_data_file_partition_path(self) -> str:
-        if self.partition_key is None:
-            raise ValueError("Cannot generate partition path based on non-partitioned WriteTask")
-        return self.partition_key.to_path()
 
     def generate_data_file_filename(self, extension: str) -> str:
         # Mimics the behavior in the Java API:
@@ -2453,10 +2702,16 @@ class WriteTask:
 
     def generate_data_file_path(self, extension: str) -> str:
         if self.partition_key:
-            file_path = f"{self.generate_data_file_partition_path()}/{self. generate_data_file_filename(extension)}"
+            file_path = f"{self.partition_key.to_path()}/{self.generate_data_file_filename(extension)}"
             return file_path
         else:
             return self.generate_data_file_filename(extension)
+
+
+@dataclass(frozen=True)
+class AddFileTask:
+    file_path: str
+    partition_field_value: Record
 
 
 def _new_manifest_path(location: str, num: int, commit_uuid: uuid.UUID) -> str:
@@ -2474,18 +2729,56 @@ class ExplicitlyDeletedDataFiles:
         self.deleted_files: List[DataFile] = []
         self.lock = threading.Lock()
 
-    def delete_file(self, data_file: DataFile) -> None:
-        with self.lock:
-            self.deleted_files.append(data_file)
+    Returns:
+        An iterable that supplies datafiles that represent the table.
+    """
+    from pyiceberg.io.pyarrow import bin_pack_arrow_table, write_file
+
+    counter = itertools.count(0)
+    write_uuid = write_uuid or uuid.uuid4()
+    target_file_size: int = PropertyUtil.property_as_int(  # type: ignore  # The property is set with non-None value.
+        properties=table_metadata.properties,
+        property_name=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
+        default=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
+    )
+
+    if len(table_metadata.spec().fields) > 0:
+        partitions = _determine_partitions(spec=table_metadata.spec(), schema=table_metadata.schema(), arrow_table=df)
+        yield from write_file(
+            io=io,
+            table_metadata=table_metadata,
+            tasks=iter([
+                WriteTask(
+                    write_uuid=write_uuid,
+                    task_id=next(counter),
+                    record_batches=batches,
+                    partition_key=partition.partition_key,
+                    schema=table_metadata.schema(),
+                )
+                for partition in partitions
+                for batches in bin_pack_arrow_table(partition.arrow_table_partition, target_file_size)
+            ]),
+        )
+    else:
+        yield from write_file(
+            io=io,
+            table_metadata=table_metadata,
+            tasks=iter([
+                WriteTask(write_uuid=write_uuid, task_id=next(counter), record_batches=batches, schema=table_metadata.schema())
+                for batches in bin_pack_arrow_table(df, target_file_size)
+            ]),
+        )
 
 
-class DeleteAllDataFiles:
-    # This is a lazy operation marker.
-    pass
+def _parquet_files_to_data_files(table_metadata: TableMetadata, file_paths: List[str], io: FileIO) -> Iterable[DataFile]:
+    """Convert a list files into DataFiles.
 
+    Returns:
+        An iterable that supplies DataFiles that describe the parquet files.
+    """
+    from pyiceberg.io.pyarrow import parquet_files_to_data_files
 
-# Define a union type that can be either ExplicitlyDeletedDataFiles or DeleteAllDataFiles
-DeletedDataFiles = Union[ExplicitlyDeletedDataFiles, DeleteAllDataFiles]
+    yield from parquet_files_to_data_files(io=io, table_metadata=table_metadata, file_paths=iter(file_paths))
 
 
 class _MergingSnapshotProducer(UpdateTableMetadata["_MergingSnapshotProducer"]):
@@ -2506,6 +2799,7 @@ class _MergingSnapshotProducer(UpdateTableMetadata["_MergingSnapshotProducer"]):
         io: FileIO,  # done, inited
         overwrite_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
         commit_uuid: Optional[uuid.UUID] = None,
+        snapshot_properties: Dict[str, str] = EMPTY_DICT,
     ) -> None:
         super().__init__(transaction)
         self.commit_uuid = commit_uuid or uuid.uuid4()  # done
@@ -2517,7 +2811,7 @@ class _MergingSnapshotProducer(UpdateTableMetadata["_MergingSnapshotProducer"]):
             snapshot.snapshot_id if (snapshot := self._transaction.table_metadata.current_snapshot()) else None
         )
         self._added_data_files = []
-        self._overwritten_partitions = set()
+        self.snapshot_properties = snapshot_properties
 
     def append_data_file(self, data_file: DataFile) -> _MergingSnapshotProducer:
         self._added_data_files.append(data_file)
@@ -2590,11 +2884,21 @@ class _MergingSnapshotProducer(UpdateTableMetadata["_MergingSnapshotProducer"]):
 
         return added_manifests.result() + filtered_manifests.result() + existing_manifests.result()
 
-    def _summary(self) -> Summary:
+    def _summary(self, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> Summary:
         ssc = SnapshotSummaryCollector()
+        partition_summary_limit = int(
+            self._transaction.table_metadata.properties.get(
+                TableProperties.WRITE_PARTITION_SUMMARY_LIMIT, TableProperties.WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT
+            )
+        )
+        ssc.set_partition_summary_limit(partition_summary_limit)
 
         for data_file in self._added_data_files:
-            ssc.add_file(data_file=data_file)
+            ssc.add_file(
+                data_file=data_file,
+                partition_spec=self._transaction.table_metadata.spec(),
+                schema=self._transaction.table_metadata.schema(),
+            )
 
         # Only delete files caused by partial overwrite.
         # Full table overwrite uses previous snapshot summary to update in a more efficient way.
@@ -2610,7 +2914,7 @@ class _MergingSnapshotProducer(UpdateTableMetadata["_MergingSnapshotProducer"]):
         summary_to_update = Summary(operation=self._operation, **ssc.build())
 
         return update_snapshot_summaries(
-            summary=summary_to_update,
+            summary=Summary(operation=self._operation, **ssc.build(), **snapshot_properties),
             previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
             truncate_full_table=isinstance(self._deleted_data_files, DeleteAllDataFiles),
         )
@@ -2619,7 +2923,7 @@ class _MergingSnapshotProducer(UpdateTableMetadata["_MergingSnapshotProducer"]):
         new_manifests = self._manifests()
         next_sequence_number = self._transaction.table_metadata.next_sequence_number()
 
-        summary = self._summary()
+        summary = self._summary(self.snapshot_properties)
 
         manifest_list_file_path = _generate_manifest_list_path(
             location=self._transaction.table_metadata.location,
@@ -3078,54 +3382,27 @@ class PartialOverwriteFiles(_MergingSnapshotProducer):
 class UpdateSnapshot:
     _transaction: Transaction
     _io: FileIO
+    _snapshot_properties: Dict[str, str]
 
-    def __init__(self, transaction: Transaction, io: FileIO) -> None:
+    def __init__(self, transaction: Transaction, io: FileIO, snapshot_properties: Dict[str, str]) -> None:
         self._transaction = transaction
         self._io = io
+        self._snapshot_properties = snapshot_properties
 
     def fast_append(self) -> FastAppendFiles:
-        return FastAppendFiles(operation=Operation.APPEND, transaction=self._transaction, io=self._io)
+        return FastAppendFiles(
+            operation=Operation.APPEND, transaction=self._transaction, io=self._io, snapshot_properties=self._snapshot_properties
+        )
 
-    def dynamic_overwrite(self) -> DynamicOverwriteFiles:
-        return DynamicOverwriteFiles(operation=Operation.OVERWRITE, transaction=self._transaction, io=self._io)
-
-    def overwrite(
-        self, overwrite_filter: Union[str, BooleanExpression] = ALWAYS_TRUE
-    ) -> Union[OverwriteFiles, PartialOverwriteFiles]:
-        if overwrite_filter == ALWAYS_TRUE:
-            return OverwriteFiles(
-                operation=Operation.OVERWRITE
-                if self._transaction.table_metadata.current_snapshot() is not None
-                else Operation.APPEND,
-                transaction=self._transaction,
-                io=self._io,
-            )
-        else:
-            return PartialOverwriteFiles(
-                operation=Operation.OVERWRITE
-                if self._transaction.table_metadata.current_snapshot() is not None
-                else Operation.APPEND,
-                transaction=self._transaction,
-                io=self._io,
-                overwrite_filter=overwrite_filter,
-            )
-
-
-def check_sequence_number(min_data_sequence_number: int, manifest: ManifestFile) -> bool:
-    """Ensure that no manifests are loaded that contain deletes that are older than the data.
-
-    Args:
-        min_data_sequence_number (int): The minimal sequence number.
-        manifest (ManifestFile): A ManifestFile that can be either data or deletes.
-
-    Returns:
-        Boolean indicating if it is either a data file, or a relevant delete file.
-    """
-    return manifest.content == ManifestContent.DATA or (
-        # Not interested in deletes that are older than the data
-        manifest.content == ManifestContent.DELETES
-        and (manifest.sequence_number or INITIAL_SEQUENCE_NUMBER) >= min_data_sequence_number
-    )
+    def overwrite(self) -> OverwriteFiles:
+        return OverwriteFiles(
+            operation=Operation.OVERWRITE
+            if self._transaction.table_metadata.current_snapshot() is not None
+            else Operation.APPEND,
+            transaction=self._transaction,
+            io=self._io,
+            snapshot_properties=self._snapshot_properties,
+        )
 
 
 class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
@@ -3369,3 +3646,281 @@ class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
 
     def _is_duplicate_partition(self, transform: Transform[Any, Any], partition_field: PartitionField) -> bool:
         return partition_field.field_id not in self._deletes and partition_field.transform == transform
+
+
+class InspectTable:
+    tbl: Table
+
+    def __init__(self, tbl: Table) -> None:
+        self.tbl = tbl
+
+        try:
+            import pyarrow as pa  # noqa
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("For metadata operations PyArrow needs to be installed") from e
+
+    def snapshots(self) -> "pa.Table":
+        import pyarrow as pa
+
+        snapshots_schema = pa.schema([
+            pa.field('committed_at', pa.timestamp(unit='ms'), nullable=False),
+            pa.field('snapshot_id', pa.int64(), nullable=False),
+            pa.field('parent_id', pa.int64(), nullable=True),
+            pa.field('operation', pa.string(), nullable=True),
+            pa.field('manifest_list', pa.string(), nullable=False),
+            pa.field('summary', pa.map_(pa.string(), pa.string()), nullable=True),
+        ])
+        snapshots = []
+        for snapshot in self.tbl.metadata.snapshots:
+            if summary := snapshot.summary:
+                operation = summary.operation.value
+                additional_properties = snapshot.summary.additional_properties
+            else:
+                operation = None
+                additional_properties = None
+
+            snapshots.append({
+                'committed_at': datetime.utcfromtimestamp(snapshot.timestamp_ms / 1000.0),
+                'snapshot_id': snapshot.snapshot_id,
+                'parent_id': snapshot.parent_snapshot_id,
+                'operation': str(operation),
+                'manifest_list': snapshot.manifest_list,
+                'summary': additional_properties,
+            })
+
+        return pa.Table.from_pylist(
+            snapshots,
+            schema=snapshots_schema,
+        )
+
+    def entries(self) -> "pa.Table":
+        import pyarrow as pa
+
+        from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+        schema = self.tbl.metadata.schema()
+
+        readable_metrics_struct = []
+
+        def _readable_metrics_struct(bound_type: PrimitiveType) -> pa.StructType:
+            pa_bound_type = schema_to_pyarrow(bound_type)
+            return pa.struct([
+                pa.field("column_size", pa.int64(), nullable=True),
+                pa.field("value_count", pa.int64(), nullable=True),
+                pa.field("null_value_count", pa.int64(), nullable=True),
+                pa.field("nan_value_count", pa.int64(), nullable=True),
+                pa.field("lower_bound", pa_bound_type, nullable=True),
+                pa.field("upper_bound", pa_bound_type, nullable=True),
+            ])
+
+        for field in self.tbl.metadata.schema().fields:
+            readable_metrics_struct.append(
+                pa.field(schema.find_column_name(field.field_id), _readable_metrics_struct(field.field_type), nullable=False)
+            )
+
+        partition_record = self.tbl.metadata.specs_struct()
+        pa_record_struct = schema_to_pyarrow(partition_record)
+
+        entries_schema = pa.schema([
+            pa.field('status', pa.int8(), nullable=False),
+            pa.field('snapshot_id', pa.int64(), nullable=False),
+            pa.field('sequence_number', pa.int64(), nullable=False),
+            pa.field('file_sequence_number', pa.int64(), nullable=False),
+            pa.field(
+                'data_file',
+                pa.struct([
+                    pa.field('content', pa.int8(), nullable=False),
+                    pa.field('file_path', pa.string(), nullable=False),
+                    pa.field('file_format', pa.string(), nullable=False),
+                    pa.field('partition', pa_record_struct, nullable=False),
+                    pa.field('record_count', pa.int64(), nullable=False),
+                    pa.field('file_size_in_bytes', pa.int64(), nullable=False),
+                    pa.field('column_sizes', pa.map_(pa.int32(), pa.int64()), nullable=True),
+                    pa.field('value_counts', pa.map_(pa.int32(), pa.int64()), nullable=True),
+                    pa.field('null_value_counts', pa.map_(pa.int32(), pa.int64()), nullable=True),
+                    pa.field('nan_value_counts', pa.map_(pa.int32(), pa.int64()), nullable=True),
+                    pa.field('lower_bounds', pa.map_(pa.int32(), pa.binary()), nullable=True),
+                    pa.field('upper_bounds', pa.map_(pa.int32(), pa.binary()), nullable=True),
+                    pa.field('key_metadata', pa.binary(), nullable=True),
+                    pa.field('split_offsets', pa.list_(pa.int64()), nullable=True),
+                    pa.field('equality_ids', pa.list_(pa.int32()), nullable=True),
+                    pa.field('sort_order_id', pa.int32(), nullable=True),
+                ]),
+                nullable=False,
+            ),
+            pa.field('readable_metrics', pa.struct(readable_metrics_struct), nullable=True),
+        ])
+
+        entries = []
+        if snapshot := self.tbl.metadata.current_snapshot():
+            for manifest in snapshot.manifests(self.tbl.io):
+                for entry in manifest.fetch_manifest_entry(io=self.tbl.io):
+                    column_sizes = entry.data_file.column_sizes or {}
+                    value_counts = entry.data_file.value_counts or {}
+                    null_value_counts = entry.data_file.null_value_counts or {}
+                    nan_value_counts = entry.data_file.nan_value_counts or {}
+                    lower_bounds = entry.data_file.lower_bounds or {}
+                    upper_bounds = entry.data_file.upper_bounds or {}
+                    readable_metrics = {
+                        schema.find_column_name(field.field_id): {
+                            "column_size": column_sizes.get(field.field_id),
+                            "value_count": value_counts.get(field.field_id),
+                            "null_value_count": null_value_counts.get(field.field_id),
+                            "nan_value_count": nan_value_counts.get(field.field_id),
+                            # Makes them readable
+                            "lower_bound": from_bytes(field.field_type, lower_bound)
+                            if (lower_bound := lower_bounds.get(field.field_id))
+                            else None,
+                            "upper_bound": from_bytes(field.field_type, upper_bound)
+                            if (upper_bound := upper_bounds.get(field.field_id))
+                            else None,
+                        }
+                        for field in self.tbl.metadata.schema().fields
+                    }
+
+                    partition = entry.data_file.partition
+                    partition_record_dict = {
+                        field.name: partition[pos]
+                        for pos, field in enumerate(self.tbl.metadata.specs()[manifest.partition_spec_id].fields)
+                    }
+
+                    entries.append({
+                        'status': entry.status.value,
+                        'snapshot_id': entry.snapshot_id,
+                        'sequence_number': entry.data_sequence_number,
+                        'file_sequence_number': entry.file_sequence_number,
+                        'data_file': {
+                            "content": entry.data_file.content,
+                            "file_path": entry.data_file.file_path,
+                            "file_format": entry.data_file.file_format,
+                            "partition": partition_record_dict,
+                            "record_count": entry.data_file.record_count,
+                            "file_size_in_bytes": entry.data_file.file_size_in_bytes,
+                            "column_sizes": dict(entry.data_file.column_sizes),
+                            "value_counts": dict(entry.data_file.value_counts),
+                            "null_value_counts": dict(entry.data_file.null_value_counts),
+                            "nan_value_counts": entry.data_file.nan_value_counts,
+                            "lower_bounds": entry.data_file.lower_bounds,
+                            "upper_bounds": entry.data_file.upper_bounds,
+                            "key_metadata": entry.data_file.key_metadata,
+                            "split_offsets": entry.data_file.split_offsets,
+                            "equality_ids": entry.data_file.equality_ids,
+                            "sort_order_id": entry.data_file.sort_order_id,
+                            "spec_id": entry.data_file.spec_id,
+                        },
+                        'readable_metrics': readable_metrics,
+                    })
+
+        return pa.Table.from_pylist(
+            entries,
+            schema=entries_schema,
+        )
+
+
+@dataclass(frozen=True)
+class TablePartition:
+    partition_key: PartitionKey
+    arrow_table_partition: pa.Table
+
+
+def _get_partition_sort_order(partition_columns: list[str], reverse: bool = False) -> dict[str, Any]:
+    order = 'ascending' if not reverse else 'descending'
+    null_placement = 'at_start' if reverse else 'at_end'
+    return {'sort_keys': [(column_name, order) for column_name in partition_columns], 'null_placement': null_placement}
+
+
+def group_by_partition_scheme(arrow_table: pa.Table, partition_columns: list[str]) -> pa.Table:
+    """Given a table, sort it by current partition scheme."""
+    # only works for identity for now
+    sort_options = _get_partition_sort_order(partition_columns, reverse=False)
+    sorted_arrow_table = arrow_table.sort_by(sorting=sort_options['sort_keys'], null_placement=sort_options['null_placement'])
+    return sorted_arrow_table
+
+
+def get_partition_columns(
+    spec: PartitionSpec,
+    schema: Schema,
+) -> list[str]:
+    partition_cols = []
+    for partition_field in spec.fields:
+        column_name = schema.find_column_name(partition_field.source_id)
+        if not column_name:
+            raise ValueError(f"{partition_field=} could not be found in {schema}.")
+        partition_cols.append(column_name)
+    return partition_cols
+
+
+def _get_table_partitions(
+    arrow_table: pa.Table,
+    partition_spec: PartitionSpec,
+    schema: Schema,
+    slice_instructions: list[dict[str, Any]],
+) -> list[TablePartition]:
+    sorted_slice_instructions = sorted(slice_instructions, key=lambda x: x['offset'])
+
+    partition_fields = partition_spec.fields
+
+    offsets = [inst["offset"] for inst in sorted_slice_instructions]
+    projected_and_filtered = {
+        partition_field.source_id: arrow_table[schema.find_field(name_or_id=partition_field.source_id).name]
+        .take(offsets)
+        .to_pylist()
+        for partition_field in partition_fields
+    }
+
+    table_partitions = []
+    for idx, inst in enumerate(sorted_slice_instructions):
+        partition_slice = arrow_table.slice(**inst)
+        fieldvalues = [
+            PartitionFieldValue(partition_field, projected_and_filtered[partition_field.source_id][idx])
+            for partition_field in partition_fields
+        ]
+        partition_key = PartitionKey(raw_partition_field_values=fieldvalues, partition_spec=partition_spec, schema=schema)
+        table_partitions.append(TablePartition(partition_key=partition_key, arrow_table_partition=partition_slice))
+    return table_partitions
+
+
+def _determine_partitions(spec: PartitionSpec, schema: Schema, arrow_table: pa.Table) -> List[TablePartition]:
+    """Based on the iceberg table partition spec, slice the arrow table into partitions with their keys.
+
+    Example:
+    Input:
+    An arrow table with partition key of ['n_legs', 'year'] and with data of
+    {'year': [2020, 2022, 2022, 2021, 2022, 2022, 2022, 2019, 2021],
+     'n_legs': [2, 2, 2, 4, 4, 4, 4, 5, 100],
+     'animal': ["Flamingo", "Parrot", "Parrot", "Dog", "Horse", "Horse", "Horse","Brittle stars", "Centipede"]}.
+    The algrithm:
+    Firstly we group the rows into partitions by sorting with sort order [('n_legs', 'descending'), ('year', 'descending')]
+    and null_placement of "at_end".
+    This gives the same table as raw input.
+    Then we sort_indices using reverse order of [('n_legs', 'descending'), ('year', 'descending')]
+    and null_placement : "at_start".
+    This gives:
+    [8, 7, 4, 5, 6, 3, 1, 2, 0]
+    Based on this we get partition groups of indices:
+    [{'offset': 8, 'length': 1}, {'offset': 7, 'length': 1}, {'offset': 4, 'length': 3}, {'offset': 3, 'length': 1}, {'offset': 1, 'length': 2}, {'offset': 0, 'length': 1}]
+    We then retrieve the partition keys by offsets.
+    And slice the arrow table by offsets and lengths of each partition.
+    """
+    import pyarrow as pa
+
+    partition_columns = get_partition_columns(spec=spec, schema=schema)
+    arrow_table = group_by_partition_scheme(arrow_table, partition_columns)
+
+    reversing_sort_order_options = _get_partition_sort_order(partition_columns, reverse=True)
+    reversed_indices = pa.compute.sort_indices(arrow_table, **reversing_sort_order_options).to_pylist()
+
+    slice_instructions: list[dict[str, Any]] = []
+    last = len(reversed_indices)
+    reversed_indices_size = len(reversed_indices)
+    ptr = 0
+    while ptr < reversed_indices_size:
+        group_size = last - reversed_indices[ptr]
+        offset = reversed_indices[ptr]
+        slice_instructions.append({"offset": offset, "length": group_size})
+        last = reversed_indices[ptr]
+        ptr = ptr + group_size
+
+    table_partitions: list[TablePartition] = _get_table_partitions(arrow_table, spec, schema, slice_instructions)
+
+    return table_partitions

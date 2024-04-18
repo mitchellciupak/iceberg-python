@@ -24,6 +24,7 @@ import pyarrow.parquet as pq
 import pytest
 from hive_metastore.ttypes import LockRequest, LockResponse, LockState, UnlockRequest
 from pyarrow.fs import S3FileSystem
+from pydantic_core import ValidationError
 
 from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.catalog.hive import HiveCatalog, _HiveClient
@@ -107,21 +108,65 @@ def test_table_properties(catalog: Catalog) -> None:
 
     with table.transaction() as transaction:
         transaction.set_properties(abc="🤪")
-
     assert table.properties == dict(abc="🤪", **DEFAULT_PROPERTIES)
 
     with table.transaction() as transaction:
         transaction.remove_properties("abc")
-
     assert table.properties == DEFAULT_PROPERTIES
 
     table = table.transaction().set_properties(abc="def").commit_transaction()
-
     assert table.properties == dict(abc="def", **DEFAULT_PROPERTIES)
 
     table = table.transaction().remove_properties("abc").commit_transaction()
+    assert table.properties == DEFAULT_PROPERTIES
+
+    table = table.transaction().set_properties(abc=123).commit_transaction()
+    # properties are stored as strings in the iceberg spec
+    assert table.properties == dict(abc="123", **DEFAULT_PROPERTIES)
+
+    with pytest.raises(ValidationError) as exc_info:
+        table.transaction().set_properties(property_name=None).commit_transaction()
+    assert "None type is not a supported value in properties: property_name" in str(exc_info.value)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('catalog', [pytest.lazy_fixture('catalog_hive'), pytest.lazy_fixture('catalog_rest')])
+def test_table_properties_dict(catalog: Catalog) -> None:
+    table = create_table(catalog)
 
     assert table.properties == DEFAULT_PROPERTIES
+
+    with table.transaction() as transaction:
+        transaction.set_properties({"abc": "🤪"})
+    assert table.properties == dict({"abc": "🤪"}, **DEFAULT_PROPERTIES)
+
+    with table.transaction() as transaction:
+        transaction.remove_properties("abc")
+    assert table.properties == DEFAULT_PROPERTIES
+
+    table = table.transaction().set_properties({"abc": "def"}).commit_transaction()
+    assert table.properties == dict({"abc": "def"}, **DEFAULT_PROPERTIES)
+
+    table = table.transaction().remove_properties("abc").commit_transaction()
+    assert table.properties == DEFAULT_PROPERTIES
+
+    table = table.transaction().set_properties({"abc": 123}).commit_transaction()
+    # properties are stored as strings in the iceberg spec
+    assert table.properties == dict({"abc": "123"}, **DEFAULT_PROPERTIES)
+
+    with pytest.raises(ValidationError) as exc_info:
+        table.transaction().set_properties({"property_name": None}).commit_transaction()
+    assert "None type is not a supported value in properties: property_name" in str(exc_info.value)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('catalog', [pytest.lazy_fixture('catalog_hive'), pytest.lazy_fixture('catalog_rest')])
+def test_table_properties_error(catalog: Catalog) -> None:
+    table = create_table(catalog)
+    properties = {"abc": "def"}
+    with pytest.raises(ValueError) as e:
+        table.transaction().set_properties(properties, abc="def").commit_transaction()
+    assert "Cannot pass both properties and kwargs" in str(e.value)
 
 
 @pytest.mark.integration
@@ -229,7 +274,6 @@ def test_ray_nan_rewritten(catalog: Catalog) -> None:
 def test_ray_not_nan_count(catalog: Catalog) -> None:
     table_test_null_nan_rewritten = catalog.load_table("default.test_null_nan_rewritten")
     ray_dataset = table_test_null_nan_rewritten.scan(row_filter=NotNaN("col_numeric"), selected_fields=("idx",)).to_ray()
-    print(ray_dataset.take())
     assert ray_dataset.count() == 2
 
 

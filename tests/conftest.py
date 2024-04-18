@@ -30,7 +30,7 @@ import re
 import socket
 import string
 import uuid
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from random import choice
 from tempfile import TemporaryDirectory
@@ -46,7 +46,6 @@ from typing import (
 import boto3
 import pytest
 from moto import mock_aws
-from pyspark.sql import SparkSession
 
 from pyiceberg import schema
 from pyiceberg.catalog import Catalog, load_catalog
@@ -79,12 +78,14 @@ from pyiceberg.types import (
     NestedField,
     StringType,
     StructType,
+    UUIDType,
 )
 from pyiceberg.utils.datetime import datetime_to_millis
 
 if TYPE_CHECKING:
     import pyarrow as pa
     from moto.server import ThreadedMotoServer  # type: ignore
+    from pyspark.sql import SparkSession
 
     from pyiceberg.io.pyarrow import PyArrowFileIO
 
@@ -892,7 +893,7 @@ manifest_entry_records = [
         "data_file": {
             "file_path": "/home/iceberg/warehouse/nyc/taxis_partitioned/data/VendorID=1/00000-633-d8a4223e-dc97-45a1-86e1-adaba6e8abd7-00002.parquet",
             "file_format": "PARQUET",
-            "partition": {"VendorID": 1, "tpep_pickup_datetime": 1925},
+            "partition": {"VendorID": 1, "tpep_pickup_datetime": None},
             "record_count": 95050,
             "file_size_in_bytes": 1265950,
             "block_size_in_bytes": 67108864,
@@ -1858,8 +1859,8 @@ def get_s3_path(bucket_name: str, database_name: Optional[str] = None, table_nam
 
 @pytest.fixture(name="s3", scope="module")
 def fixture_s3_client() -> boto3.client:
-    with mock_aws():
-        yield boto3.client("s3")
+    """Real S3 client for AWS Integration Tests."""
+    yield boto3.client("s3")
 
 
 def clean_up(test_catalog: Catalog) -> None:
@@ -1928,6 +1929,16 @@ def bound_reference_str() -> BoundReference[str]:
     return BoundReference(field=NestedField(1, "field", StringType(), required=False), accessor=Accessor(position=0, inner=None))
 
 
+@pytest.fixture
+def bound_reference_binary() -> BoundReference[str]:
+    return BoundReference(field=NestedField(1, "field", BinaryType(), required=False), accessor=Accessor(position=0, inner=None))
+
+
+@pytest.fixture
+def bound_reference_uuid() -> BoundReference[str]:
+    return BoundReference(field=NestedField(1, "field", UUIDType(), required=False), accessor=Accessor(position=0, inner=None))
+
+
 @pytest.fixture(scope="session")
 def session_catalog() -> Catalog:
     return load_catalog(
@@ -1943,9 +1954,10 @@ def session_catalog() -> Catalog:
 
 
 @pytest.fixture(scope="session")
-def spark() -> SparkSession:
+def spark() -> "SparkSession":
     import importlib.metadata
-    import os
+
+    from pyspark.sql import SparkSession
 
     spark_version = ".".join(importlib.metadata.version("pyspark").split(".")[:2])
     scala_version = "2.12"
@@ -1965,6 +1977,7 @@ def spark() -> SparkSession:
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.integration", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.integration.catalog-impl", "org.apache.iceberg.rest.RESTCatalog")
+        .config("spark.sql.catalog.integration.cache-enabled", "false")
         .config("spark.sql.catalog.integration.uri", "http://localhost:8181")
         .config("spark.sql.catalog.integration.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
         .config("spark.sql.catalog.integration.warehouse", "s3://warehouse/wh/")
@@ -1975,3 +1988,83 @@ def spark() -> SparkSession:
     )
 
     return spark
+
+
+TEST_DATA_WITH_NULL = {
+    'bool': [False, None, True],
+    'string': ['a', None, 'z'],
+    # Go over the 16 bytes to kick in truncation
+    'string_long': ['a' * 22, None, 'z' * 22],
+    'int': [1, None, 9],
+    'long': [1, None, 9],
+    'float': [0.0, None, 0.9],
+    'double': [0.0, None, 0.9],
+    # 'time': [1_000_000, None, 3_000_000],  # Example times: 1s, none, and 3s past midnight #Spark does not support time fields
+    'timestamp': [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
+    'timestamptz': [
+        datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
+        None,
+        datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
+    ],
+    'date': [date(2023, 1, 1), None, date(2023, 3, 1)],
+    # Not supported by Spark
+    # 'time': [time(1, 22, 0), None, time(19, 25, 0)],
+    # Not natively supported by Arrow
+    # 'uuid': [uuid.UUID('00000000-0000-0000-0000-000000000000').bytes, None, uuid.UUID('11111111-1111-1111-1111-111111111111').bytes],
+    'binary': [b'\01', None, b'\22'],
+    'fixed': [
+        uuid.UUID('00000000-0000-0000-0000-000000000000').bytes,
+        None,
+        uuid.UUID('11111111-1111-1111-1111-111111111111').bytes,
+    ],
+}
+
+
+@pytest.fixture(scope="session")
+def pa_schema() -> "pa.Schema":
+    import pyarrow as pa
+
+    return pa.schema([
+        ("bool", pa.bool_()),
+        ("string", pa.string()),
+        ("string_long", pa.string()),
+        ("int", pa.int32()),
+        ("long", pa.int64()),
+        ("float", pa.float32()),
+        ("double", pa.float64()),
+        # Not supported by Spark
+        # ("time", pa.time64('us')),
+        ("timestamp", pa.timestamp(unit="us")),
+        ("timestamptz", pa.timestamp(unit="us", tz="UTC")),
+        ("date", pa.date32()),
+        # Not supported by Spark
+        # ("time", pa.time64("us")),
+        # Not natively supported by Arrow
+        # ("uuid", pa.fixed(16)),
+        ("binary", pa.large_binary()),
+        ("fixed", pa.binary(16)),
+    ])
+
+
+@pytest.fixture(scope="session")
+def arrow_table_with_null(pa_schema: "pa.Schema") -> "pa.Table":
+    """Pyarrow table with all kinds of columns."""
+    import pyarrow as pa
+
+    return pa.Table.from_pydict(TEST_DATA_WITH_NULL, schema=pa_schema)
+
+
+@pytest.fixture(scope="session")
+def arrow_table_without_data(pa_schema: "pa.Schema") -> "pa.Table":
+    """Pyarrow table without data."""
+    import pyarrow as pa
+
+    return pa.Table.from_pylist([], schema=pa_schema)
+
+
+@pytest.fixture(scope="session")
+def arrow_table_with_only_nulls(pa_schema: "pa.Schema") -> "pa.Table":
+    """Pyarrow table with only null values."""
+    import pyarrow as pa
+
+    return pa.Table.from_pylist([{}, {}], schema=pa_schema)

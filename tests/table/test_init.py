@@ -54,16 +54,18 @@ from pyiceberg.table import (
     AssertLastAssignedPartitionId,
     AssertRefSnapshotId,
     AssertTableUUID,
+    CommitTableRequest,
     RemovePropertiesUpdate,
     SetDefaultSortOrderUpdate,
     SetPropertiesUpdate,
     SetSnapshotRefUpdate,
-    SnapshotRef,
     StaticTable,
     Table,
+    TableIdentifier,
     UpdateSchema,
     _apply_table_update,
-    _check_schema,
+    _check_schema_compatible,
+    _determine_partitions,
     _match_deletes_to_data_file,
     _TableMetadataUpdateContext,
     get_partition_columns,
@@ -74,6 +76,7 @@ from pyiceberg.table import (
     verify_table_already_sorted,
 )
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadataUtil, TableMetadataV2, _generate_snapshot_id
+from pyiceberg.table.refs import SnapshotRef
 from pyiceberg.table.snapshots import (
     Operation,
     Snapshot,
@@ -88,7 +91,6 @@ from pyiceberg.table.sorting import (
 )
 from pyiceberg.transforms import (
     BucketTransform,
-    DayTransform,
     IdentityTransform,
 )
 from pyiceberg.typedef import Record
@@ -1042,7 +1044,7 @@ def test_schema_mismatch_type(table_schema_simple: Schema) -> None:
 """
 
     with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema_simple, other_schema)
+        _check_schema_compatible(table_schema_simple, other_schema)
 
 
 def test_schema_mismatch_nullability(table_schema_simple: Schema) -> None:
@@ -1063,7 +1065,7 @@ def test_schema_mismatch_nullability(table_schema_simple: Schema) -> None:
 """
 
     with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema_simple, other_schema)
+        _check_schema_compatible(table_schema_simple, other_schema)
 
 
 def test_schema_mismatch_missing_field(table_schema_simple: Schema) -> None:
@@ -1083,7 +1085,7 @@ def test_schema_mismatch_missing_field(table_schema_simple: Schema) -> None:
 """
 
     with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema_simple, other_schema)
+        _check_schema_compatible(table_schema_simple, other_schema)
 
 
 def test_schema_mismatch_additional_field(table_schema_simple: Schema) -> None:
@@ -1097,7 +1099,21 @@ def test_schema_mismatch_additional_field(table_schema_simple: Schema) -> None:
     expected = r"PyArrow table contains more columns: new_field. Update the schema first \(hint, use union_by_name\)."
 
     with pytest.raises(ValueError, match=expected):
-        _check_schema(table_schema_simple, other_schema)
+        _check_schema_compatible(table_schema_simple, other_schema)
+
+
+def test_schema_downcast(table_schema_simple: Schema) -> None:
+    # large_string type is compatible with string type
+    other_schema = pa.schema((
+        pa.field("foo", pa.large_string(), nullable=True),
+        pa.field("bar", pa.int32(), nullable=False),
+        pa.field("baz", pa.bool_(), nullable=True),
+    ))
+
+    try:
+        _check_schema_compatible(table_schema_simple, other_schema)
+    except Exception:
+        pytest.fail("Unexpected Exception raised when calling `_check_schema`")
 
 
 def test_table_properties(example_table_metadata_v2: Dict[str, Any]) -> None:
@@ -1126,63 +1142,17 @@ def test_table_properties_raise_for_none_value(example_table_metadata_v2: Dict[s
     assert "None type is not a supported value in properties: property_name" in str(exc_info.value)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "input_sorted_indices, expected_sorted_or_not",
-    [
-        (pa.array([2, 1, 0], type=pa.uint64()), False),
-        (pa.array([0, 1, 2, 3, 4, 5], type=pa.uint64()), True),
-        (pa.array([0, 1, 2, 3, 4, 5], type=pa.int64()), False),
-        (pa.array([-1, 0, 1], type=pa.int64()), False),
-        (pa.array([1, 2, 4], type=pa.uint64()), False),
-        (pa.array([0], type=pa.uint64()), True),
-        (pa.array([1], type=pa.uint64()), False),
-        (pa.array([2, 3, 4], type=pa.uint64()), False),
-    ],
-)
-def test_verify_table_already_sorted(input_sorted_indices: pa.Array, expected_sorted_or_not: bool) -> None:
-    assert verify_table_already_sorted(input_sorted_indices) == expected_sorted_or_not
-
-
-def test_pad_transformed_columns_and_get_partition_cols() -> None:
-    import pyarrow as pa
-
-    test_pa_schema = pa.schema([("foo", pa.string()), ("bar", pa.int64()), ("baz", pa.timestamp(unit="us"))])
-    test_schema = Schema(
-        NestedField(field_id=1, name="foo", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="bar", field_type=IntegerType(), required=True),
-        NestedField(field_id=3, name="baz", field_type=TimestampType(), required=False),
-        schema_id=1,
-    )
-    test_data = {
-        'foo': ['a', None, 'z'],
-        'bar': [1, 2, 3],
-        'baz': [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
-    }
-    arrow_table = pa.Table.from_pydict(test_data, schema=test_pa_schema)
-    partition_spec = PartitionSpec(
-        PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="foo_identity"),
-        PartitionField(source_id=3, field_id=1003, transform=DayTransform(), name="baz_day"),
+def test_serialize_commit_table_request() -> None:
+    request = CommitTableRequest(
+        requirements=(AssertTableUUID(uuid='4bfd18a3-74c6-478e-98b1-71c4c32f4163'),),
+        identifier=TableIdentifier(namespace=['a'], name='b'),
     )
 
-    # when
-    padded, padded_cols = pad_transformed_columns(partition_spec, test_schema, arrow_table)
-    # then
-    assert padded['baz_day'].to_pylist() == [19358, None, 19417]
-    assert padded.column_names == ["foo", "bar", "baz", "baz_day"]
-
-    # when
-    cols = get_partition_columns(partition_spec, test_schema, arrow_table)
-    # then
-    assert cols == ["foo", "baz_day"]
-
-    # when
-    table_removed_columns = remove_padding(padded, padded_cols)
-    # then
-    assert table_removed_columns == arrow_table
+    deserialized_request = CommitTableRequest.model_validate_json(request.model_dump_json())
+    assert request == deserialized_request
 
 
-def test_partition() -> None:
+def test_partition_for_demo() -> None:
     import pyarrow as pa
 
     test_pa_schema = pa.schema([('year', pa.int64()), ("n_legs", pa.int64()), ("animal", pa.string())])
@@ -1202,7 +1172,7 @@ def test_partition() -> None:
         PartitionField(source_id=2, field_id=1002, transform=IdentityTransform(), name="n_legs_identity"),
         PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="year_identity"),
     )
-    result = partition(partition_spec, test_schema, arrow_table)
+    result = _determine_partitions(partition_spec, test_schema, arrow_table)
     assert {table_partition.partition_key.partition for table_partition in result} == {
         Record(n_legs_identity=2, year_identity=2020),
         Record(n_legs_identity=100, year_identity=2021),
@@ -1216,39 +1186,49 @@ def test_partition() -> None:
     )
 
 
-def test_partition_with_hidden_partitioning() -> None:
+def test_identity_partition_on_multi_columns() -> None:
     import pyarrow as pa
 
-    test_pa_schema = pa.schema([('ts', pa.timestamp('ms')), ("n_legs", pa.int64()), ("animal", pa.string())])
+    test_pa_schema = pa.schema([('born_year', pa.int64()), ("n_legs", pa.int64()), ("animal", pa.string())])
     test_schema = Schema(
-        NestedField(field_id=1, name='ts', field_type=TimestampType(), required=False),
+        NestedField(field_id=1, name='born_year', field_type=StringType(), required=False),
         NestedField(field_id=2, name='n_legs', field_type=IntegerType(), required=True),
         NestedField(field_id=3, name='animal', field_type=StringType(), required=False),
         schema_id=1,
     )
-    test_data = {
-        'ts': [
-            datetime(2023, 1, 1, 19, 25, 00),
-            None,
-            datetime(2023, 1, 1, 20, 00, 00),
-            datetime(2023, 1, 1, 19, 25, 00),
-            datetime(2023, 3, 1, 19, 25, 00),
-        ],
-        'n_legs': [2, 2, 2, 4, 4],
-        'animal': ["Flamingo", "Parrot", "Parrot", "Horse", "Dog"],
-    }
-    arrow_table = pa.Table.from_pydict(test_data, schema=test_pa_schema)
+    # 5 partitions, 6 unique row values, 12 rows
+    test_rows = [
+        (2021, 4, "Dog"),
+        (2022, 4, "Horse"),
+        (2022, 4, "Another Horse"),
+        (2021, 100, "Centipede"),
+        (None, 4, "Kirin"),
+        (2021, None, "Fish"),
+    ] * 2
+    expected = {Record(n_legs_identity=test_rows[i][1], year_identity=test_rows[i][0]) for i in range(len(test_rows))}
     partition_spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1002, transform=IdentityTransform(), name="n_legs_identity"),
-        PartitionField(source_id=1, field_id=1001, transform=DayTransform(), name="ts_day"),
+        PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="year_identity"),
     )
-    result = partition(partition_spec, test_schema, arrow_table)
-    assert {table_partition.partition_key.partition for table_partition in result} == {
-        Record(n_legs_identity=2, ts_day=19358),
-        Record(n_legs_identity=2, ts_day=None),
-        Record(n_legs_identity=4, ts_day=19417),
-        Record(n_legs_identity=4, ts_day=19358),
-    }
-    assert (
-        pa.concat_tables([table_partition.arrow_table_partition for table_partition in result]).num_rows == arrow_table.num_rows
-    )
+    import random
+
+    # there are 12! / ((2!)^6) = 7,484,400 permutations, too many to pick all
+    for _ in range(1000):
+        random.shuffle(test_rows)
+        test_data = {
+            'born_year': [row[0] for row in test_rows],
+            'n_legs': [row[1] for row in test_rows],
+            'animal': [row[2] for row in test_rows],
+        }
+        arrow_table = pa.Table.from_pydict(test_data, schema=test_pa_schema)
+
+        result = _determine_partitions(partition_spec, test_schema, arrow_table)
+
+        assert {table_partition.partition_key.partition for table_partition in result} == expected
+        concatenated_arrow_table = pa.concat_tables([table_partition.arrow_table_partition for table_partition in result])
+        assert concatenated_arrow_table.num_rows == arrow_table.num_rows
+        assert concatenated_arrow_table.sort_by([
+            ('born_year', 'ascending'),
+            ('n_legs', 'ascending'),
+            ('animal', 'ascending'),
+        ]) == arrow_table.sort_by([('born_year', 'ascending'), ('n_legs', 'ascending'), ('animal', 'ascending')])

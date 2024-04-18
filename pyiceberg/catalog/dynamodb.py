@@ -33,9 +33,7 @@ from pyiceberg.catalog import (
     METADATA_LOCATION,
     PREVIOUS_METADATA_LOCATION,
     TABLE_TYPE,
-    Catalog,
-    Identifier,
-    Properties,
+    MetastoreCatalog,
     PropertiesUpdateSummary,
 )
 from pyiceberg.exceptions import (
@@ -56,7 +54,7 @@ from pyiceberg.serializers import FromInputFile
 from pyiceberg.table import CommitTableRequest, CommitTableResponse, Table
 from pyiceberg.table.metadata import new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
-from pyiceberg.typedef import EMPTY_DICT
+from pyiceberg.typedef import EMPTY_DICT, Identifier, Properties
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -81,7 +79,7 @@ ACTIVE = "ACTIVE"
 ITEM = "Item"
 
 
-class DynamoDbCatalog(Catalog):
+class DynamoDbCatalog(MetastoreCatalog):
     def __init__(self, name: str, **properties: str):
         super().__init__(name, **properties)
         session = boto3.Session(

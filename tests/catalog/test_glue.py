@@ -32,7 +32,10 @@ from pyiceberg.exceptions import (
     NoSuchTableError,
     TableAlreadyExistsError,
 )
+from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import IntegerType
 from tests.conftest import BUCKET_NAME, TABLE_METADATA_LOCATION_REGEX
 
@@ -692,3 +695,114 @@ def test_commit_table_properties(
     updated_table_metadata = table.metadata
     assert test_catalog._parse_metadata_version(table.metadata_location) == 1
     assert updated_table_metadata.properties == {"test_a": "test_aa", "test_c": "test_c"}
+
+
+@mock_aws
+def test_commit_append_table_snapshot_properties(
+    _bucket_initialize: None, moto_endpoint_url: str, table_schema_simple: Schema, database_name: str, table_name: str
+) -> None:
+    catalog_name = "glue"
+    identifier = (database_name, table_name)
+    test_catalog = GlueCatalog(catalog_name, **{"s3.endpoint": moto_endpoint_url, "warehouse": f"s3://{BUCKET_NAME}"})
+    test_catalog.create_namespace(namespace=database_name)
+    table = test_catalog.create_table(identifier=identifier, schema=table_schema_simple)
+
+    assert test_catalog._parse_metadata_version(table.metadata_location) == 0
+
+    table.append(
+        pa.Table.from_pylist(
+            [{"foo": "foo_val", "bar": 1, "baz": False}],
+            schema=schema_to_pyarrow(table_schema_simple),
+        ),
+        snapshot_properties={"snapshot_prop_a": "test_prop_a"},
+    )
+
+    updated_table_metadata = table.metadata
+    summary = updated_table_metadata.snapshots[-1].summary
+    assert test_catalog._parse_metadata_version(table.metadata_location) == 1
+    assert summary is not None
+    assert summary["snapshot_prop_a"] == "test_prop_a"
+
+
+@mock_aws
+def test_commit_overwrite_table_snapshot_properties(
+    _bucket_initialize: None, moto_endpoint_url: str, table_schema_simple: Schema, database_name: str, table_name: str
+) -> None:
+    catalog_name = "glue"
+    identifier = (database_name, table_name)
+    test_catalog = GlueCatalog(catalog_name, **{"s3.endpoint": moto_endpoint_url, "warehouse": f"s3://{BUCKET_NAME}"})
+    test_catalog.create_namespace(namespace=database_name)
+    table = test_catalog.create_table(identifier=identifier, schema=table_schema_simple)
+
+    assert test_catalog._parse_metadata_version(table.metadata_location) == 0
+
+    table.append(
+        pa.Table.from_pylist(
+            [{"foo": "foo_val", "bar": 1, "baz": False}],
+            schema=schema_to_pyarrow(table_schema_simple),
+        ),
+        snapshot_properties={"snapshot_prop_a": "test_prop_a"},
+    )
+
+    assert test_catalog._parse_metadata_version(table.metadata_location) == 1
+
+    table.overwrite(
+        pa.Table.from_pylist(
+            [{"foo": "foo_val", "bar": 2, "baz": True}],
+            schema=schema_to_pyarrow(table_schema_simple),
+        ),
+        snapshot_properties={"snapshot_prop_b": "test_prop_b"},
+    )
+
+    updated_table_metadata = table.metadata
+    summary = updated_table_metadata.snapshots[-1].summary
+    assert test_catalog._parse_metadata_version(table.metadata_location) == 2
+    assert summary is not None
+    assert summary["snapshot_prop_a"] is None
+    assert summary["snapshot_prop_b"] == "test_prop_b"
+
+
+@mock_aws
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_create_table_transaction(
+    _glue: boto3.client,
+    _bucket_initialize: None,
+    moto_endpoint_url: str,
+    table_schema_nested: Schema,
+    database_name: str,
+    table_name: str,
+    format_version: int,
+) -> None:
+    catalog_name = "glue"
+    identifier = (database_name, table_name)
+    test_catalog = GlueCatalog(catalog_name, **{"s3.endpoint": moto_endpoint_url, "warehouse": f"s3://{BUCKET_NAME}"})
+    test_catalog.create_namespace(namespace=database_name)
+
+    with test_catalog.create_table_transaction(
+        identifier,
+        table_schema_nested,
+        partition_spec=PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="foo")),
+        properties={"format-version": format_version},
+    ) as txn:
+        with txn.update_schema() as update_schema:
+            update_schema.add_column(path="b", field_type=IntegerType())
+
+        with txn.update_spec() as update_spec:
+            update_spec.add_identity("bar")
+
+        txn.set_properties(test_a="test_aa", test_b="test_b", test_c="test_c")
+
+    table = test_catalog.load_table(identifier)
+
+    assert TABLE_METADATA_LOCATION_REGEX.match(table.metadata_location)
+    assert test_catalog._parse_metadata_version(table.metadata_location) == 0
+    assert table.format_version == format_version
+    assert table.schema().find_field("b").field_type == IntegerType()
+    assert table.properties == {"test_a": "test_aa", "test_b": "test_b", "test_c": "test_c"}
+    assert table.spec().last_assigned_field_id == 1001
+    assert table.spec().fields_by_source_id(1)[0].name == "foo"
+    assert table.spec().fields_by_source_id(1)[0].field_id == 1000
+    assert table.spec().fields_by_source_id(1)[0].transform == IdentityTransform()
+    assert table.spec().fields_by_source_id(2)[0].name == "bar"
+    assert table.spec().fields_by_source_id(2)[0].field_id == 1001
+    assert table.spec().fields_by_source_id(2)[0].transform == IdentityTransform()

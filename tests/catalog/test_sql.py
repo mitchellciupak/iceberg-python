@@ -25,7 +25,6 @@ from pydantic_core import ValidationError
 from pytest_lazyfixture import lazy_fixture
 from sqlalchemy.exc import ArgumentError, IntegrityError
 
-from pyiceberg.catalog import Identifier
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.exceptions import (
     CommitFailedException,
@@ -49,6 +48,7 @@ from pyiceberg.table.sorting import (
     SortOrder,
 )
 from pyiceberg.transforms import IdentityTransform
+from pyiceberg.typedef import Identifier
 from pyiceberg.types import IntegerType
 
 
@@ -191,6 +191,36 @@ def test_create_table_with_pyarrow_schema(
     table = catalog.create_table(random_identifier, pyarrow_schema_simple_without_ids)
     assert table.schema() == iceberg_table_schema_simple
     catalog.drop_table(random_identifier)
+
+
+@pytest.mark.parametrize(
+    'catalog',
+    [
+        lazy_fixture('catalog_memory'),
+        lazy_fixture('catalog_sqlite'),
+    ],
+)
+def test_write_pyarrow_schema(catalog: SqlCatalog, random_identifier: Identifier) -> None:
+    import pyarrow as pa
+
+    pyarrow_table = pa.Table.from_arrays(
+        [
+            pa.array([None, "A", "B", "C"]),  # 'foo' column
+            pa.array([1, 2, 3, 4]),  # 'bar' column
+            pa.array([True, None, False, True]),  # 'baz' column
+            pa.array([None, "A", "B", "C"]),  # 'large' column
+        ],
+        schema=pa.schema([
+            pa.field('foo', pa.string(), nullable=True),
+            pa.field('bar', pa.int32(), nullable=False),
+            pa.field('baz', pa.bool_(), nullable=True),
+            pa.field('large', pa.large_string(), nullable=True),
+        ]),
+    )
+    database_name, _table_name = random_identifier
+    catalog.create_namespace(database_name)
+    table = catalog.create_table(random_identifier, pyarrow_table.schema)
+    table.overwrite(pyarrow_table)
 
 
 @pytest.mark.parametrize(
